@@ -1,0 +1,1859 @@
+// G144/G145: defined in ps2_gs_rasterizer.cpp; drains pending tile-binning deferred triangles
+// before transfers that overlap VRAM they depend on. Unknown ranges fall back to flushing.
+// G149: bump the de-swizzle texture-cache VRAM generation so stale decoded buffers are invalidated.
+// G260: native-renderer command graph (opt-in DC2_G260_NR=1) — when active, transfers must take
+// the RANGE-tested barrier path (the graph executes only on real dependency edges).
+extern bool g260NrEnabled();
+extern void g149BumpVramGen();
+extern void g144FlushPendingUpload();
+extern void g144FlushPendingUploadRange(uint32_t dbp,
+                                        uint8_t dbw,
+                                        uint8_t dpsm,
+                                        uint32_t dsax,
+                                        uint32_t dsay,
+                                        uint32_t rrw,
+                                        uint32_t rrh);
+// G522: fail-safe replay of the local->local guest-VRAM publication that the range barrier skipped
+// on the promise of an FBO->FBO blit. A no-op unless that edge skipped AND the blit was not taken.
+extern void g144L2lLatePin();
+// G627: reconcile the l2l destination bytes the CPU pixel body just wrote into guest VRAM back into
+// the resident CT32 surface with a per-byte-lane masked patch. Armed only when the same edge took
+// that surface's publication off the dependency pin; a no-op otherwise.
+extern void g627ApplyPendingL2lPatch(uint8_t *vram, uint32_t vramSize);
+extern void g627DiscardPendingL2lPatch();
+// G714: execute a same-format local->local transfer against the GPU-resident raw GS VRAM image.
+// Returns true only when the whole operation — source ingest, copy and destination publication —
+// ran on the GPU, in which case guest VRAM is deliberately untouched and the caller must NOT run
+// the CPU body, the depth barrier, or the VRAM write notification.
+extern bool g714TryExecuteL2l(uint8_t *vram, uint32_t vramSize,
+                              uint32_t sbp, uint8_t sbw, uint8_t spsm,
+                              uint32_t ssax, uint32_t ssay,
+                              uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                              uint32_t dsax, uint32_t dsay,
+                              uint32_t rrw, uint32_t rrh, bool revX, bool revY);
+// Census only (DC2_G714_STAT=1): the escaping transfer's pixel count. The REFUSAL CLASS is
+// recorded at the barrier, not here — by this point the barrier has already published, so a second
+// evaluation of the predicate would read a state that no longer explains the decision.
+extern void g714NoteEscape(uint32_t rrw, uint32_t rrh);
+extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
+                                               uint8_t sbw,
+                                               uint8_t spsm,
+                                               uint32_t ssax,
+                                               uint32_t ssay,
+                                               uint32_t dbp,
+                                               uint8_t dbw,
+                                               uint8_t dpsm,
+                                               uint32_t dsax,
+                                               uint32_t dsay,
+                                               uint32_t rrw,
+                                               uint32_t rrh);
+// G242: when opt-in GPU guest-depth ownership is active, materialize an overlapping
+// GPU-resident depth surface before a transfer reads its guest-VRAM source. No-op otherwise.
+extern void g242PrepareVramReadRect(uint8_t *vram,
+                                    uint32_t bpBlocks,
+                                    uint32_t bw64,
+                                    uint32_t psm,
+                                    uint32_t x,
+                                    uint32_t y,
+                                    uint32_t w,
+                                    uint32_t h);
+extern bool g242GuestDepthEnabled();
+extern bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
+                                uint32_t sbp, uint8_t sbw, uint8_t spsm,
+                                uint32_t ssax, uint32_t ssay,
+                                uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                uint32_t dsax, uint32_t dsay,
+                                uint32_t rrw, uint32_t rrh);
+extern void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                   uint32_t dsax, uint32_t dsay,
+                                   uint32_t rrw, uint32_t rrh);
+extern void g314NoteImageComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                  uint32_t dsax, uint32_t dsay,
+                                  uint32_t rrw, uint32_t rrh);
+extern void g327NoteImageChunk(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                               uint32_t dsax, uint32_t dsay,
+                               uint32_t rrw, uint32_t rrh,
+                               uint32_t sizeBytes, bool complete);
+
+void GS::performLocalToLocalTransfer()
+{
+    G146PerfScope g146Scope(g_g146GsLocalNs);
+    G654LayerScope g654Scope(kG654LayerGsLocal); // G654 P17, empty in the default build
+    // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
+    {
+        extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
+        static const bool s_g219on = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219on)
+        {
+            static thread_local char s_g219tag[80];
+            std::snprintf(s_g219tag, sizeof(s_g219tag), "l2l(sbp=0x%x dbp=0x%x rr=%ux%u)",
+                          m_bitbltbuf.sbp, m_bitbltbuf.dbp, m_trxreg.rrw, m_trxreg.rrh);
+            g219Sentinel(m_vram, m_vramSize, s_g219tag);
+        }
+    }
+
+    static const bool s_g145EnvDirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                             !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    const bool g145DirtyUpload = (g268LiveEnvRead()
+                                      ? (envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                         !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD"))
+                                      : s_g145EnvDirtyUpload) ||
+                                 g260NrEnabled();
+
+    uint32_t sbp = m_bitbltbuf.sbp;
+    uint8_t sbw = m_bitbltbuf.sbw;
+    uint8_t spsm = m_bitbltbuf.spsm;
+    uint32_t dbp = m_bitbltbuf.dbp;
+    uint8_t dbw = m_bitbltbuf.dbw;
+    uint8_t dpsm = m_bitbltbuf.dpsm;
+
+    if (sbw == 0)
+        sbw = 1;
+    if (dbw == 0)
+        dbw = 1;
+
+    const uint32_t rrw = m_trxreg.rrw;
+    const uint32_t rrh = m_trxreg.rrh;
+    const uint32_t ssax = m_trxpos.ssax;
+    const uint32_t ssay = m_trxpos.ssay;
+    const uint32_t dsax = m_trxpos.dsax;
+    const uint32_t dsay = m_trxpos.dsay;
+
+    // G414 diagnostic (2026-07-29 NO-GO): a non-empty local-to-local transfer whose
+    // complete source and destination mappings are identical cannot change GS local
+    // memory. The opt-in arm retires it before G144/G242 materialization, ownership
+    // publication, or a VRAM-generation bump and fails closed on every unlike field.
+    // Keep default-off: its lean MAP-0 3x3 regressed 2.96% despite reducing the
+    // measured materialization slice (plans/phase-G414-fix-log.md).
+    static const bool s_g414SelfCopyOn =
+        envFlagEnabled("DC2_G414_L2L_SELF_COPY") &&
+        !envFlagEnabled("DC2_G414_NO_L2L_SELF_COPY");
+    static const bool s_g414StatOn = envFlagEnabled("DC2_G414_STAT");
+    const bool g414ExactSelfCopy =
+        m_vram != nullptr &&
+        rrw != 0u && rrh != 0u &&
+        sbp == dbp &&
+        sbw == dbw &&
+        spsm == dpsm &&
+        ssax == dsax &&
+        ssay == dsay;
+    if (s_g414SelfCopyOn && g414ExactSelfCopy)
+    {
+        static std::atomic<uint64_t> s_g414Skipped{0u};
+        static std::atomic<uint64_t> s_g414Pixels{0u};
+        const uint64_t skipped =
+            s_g414Skipped.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t pixelsAdded =
+            static_cast<uint64_t>(rrw) * static_cast<uint64_t>(rrh);
+        const uint64_t pixels =
+            s_g414Pixels.fetch_add(pixelsAdded, std::memory_order_relaxed) + pixelsAdded;
+        if (s_g414StatOn && (skipped == 1u || (skipped & 255u) == 0u))
+        {
+            std::fprintf(stderr,
+                         "[G414:selfcopy] skipped=%llu pixels=%llu bp=0x%x bw=%u psm=0x%x xy=(%u,%u) rr=(%u,%u)\n",
+                         static_cast<unsigned long long>(skipped),
+                         static_cast<unsigned long long>(pixels),
+                         sbp, static_cast<uint32_t>(sbw), static_cast<uint32_t>(spsm),
+                         ssax, ssay, rrw, rrh);
+        }
+        return;
+    }
+
+    // G432: the l2l call is not one thing — census each blocking stage apart from the pixel body.
+    const bool g432L2lArmed = g432CensusOn();
+    const uint64_t g432L2lPx = static_cast<uint64_t>(rrw) * rrh;
+
+    if (!g145DirtyUpload)
+    {
+        if (g432L2lArmed)
+        {
+            G432Scope sc(&s_g432LFlush, g432L2lPx);
+            g144FlushPendingUpload();
+        }
+        else
+        {
+            g144FlushPendingUpload();
+        }
+    }
+
+    if (!m_vram)
+        return;
+
+    const GSTransferTraversal traversal = decodeTransferTraversal(m_trxpos.dir);
+    const bool formatAware = (spsm == dpsm) && supportsFormatAwareLocalCopy(spsm);
+
+    if (rrw == 0u || rrh == 0u)
+    {
+        return;
+    }
+
+    // ⛔⛔⛔ G713 LOCAL->LOCAL CEILING PROBE (DC2_G713_L2L_CEIL=1, default OFF, KNOWINGLY WRONG
+    // OUTPUT — never promote). Skips the range barrier, the source materialisation
+    // (g242PrepareVramReadRect, which IS the kG261MatLocal readback) and the CPU copy, while still
+    // bumping the destination's write generations so both arms do identical publication
+    // bookkeeping and the workload stays invariant. This prices the WHOLE local->local direction
+    // — copy plus the readback it forces — which is what a widened g289 admission would have to
+    // remove to be worth anything. See g713_pipe_gs.inc for why both terms must be priced together.
+    if (g713L2lCeilOn())
+    {
+        extern void g178NoteVramWriteRectTagged(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        g149BumpVramGen();
+        g178NoteVramWriteRectTagged(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh, 8u);
+        g627DiscardPendingL2lPatch();
+        if (g713L2lStatOn())
+            g713NoteL2l(false, sbp, spsm, dbp, dpsm, rrw, rrh);
+        return;
+    }
+
+    if (g145DirtyUpload)
+    {
+        if (g432L2lArmed)
+        {
+            G432Scope sc(&s_g432LFlush, g432L2lPx);
+            g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
+                                               dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        }
+        else
+        {
+            g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
+                                               dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        }
+    }
+
+    // ⭐⭐⭐ G714: THE GPU-RESIDENT RAW-VRAM PATH, AND WHY IT SITS EXACTLY HERE.
+    // Everything below this point exists to make the CPU pixel body able to READ guest VRAM:
+    // g242PrepareVramReadRect publishes aliased GPU depth, g144L2lLatePin replays the colour
+    // publication, g178NoteVramWriteRectTagged declares that VRAM changed. An admitted G714
+    // transfer does none of those things — it moves GS bytes inside the GPU's raw VRAM image and
+    // pushes the result straight into the destination target's FBO. Guest VRAM is left stale, and
+    // that debt is already carried by the residency record (the rows were dirty by admission), so
+    // the whole publication the edge used to pay simply does not happen.
+    // Placing the attempt ABOVE g242PrepareVramReadRect is the phase's central invariant (§4): a
+    // "GPU copy" that first materialises its source has missed the point.
+    if (g714TryExecuteL2l(m_vram, m_vramSize, sbp, sbw, spsm, ssax, ssay,
+                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                          traversal.reverseX, traversal.reverseY))
+    {
+        g149BumpVramGen();            // logical content moved: drop the de-swizzle texture cache
+        g627DiscardPendingL2lPatch(); // no CPU copy ran, so there are no VRAM bytes to reconcile
+        if (g713L2lStatOn())
+            g713NoteL2l(true, sbp, spsm, dbp, dpsm, rrw, rrh);
+        return;
+    }
+    g714NoteEscape(rrw, rrh);
+
+    // G242: the range/full G144 barrier above must run first so every deferred draw
+    // that can feed this copy has reached its GPU depth surface before we read VRAM.
+    if (g432L2lArmed)
+    {
+        G432Scope sc(&s_g432LPrep, g432L2lPx);
+        g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+    }
+    else
+    {
+        g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+    }
+
+    bool g289GpuCopy;
+    if (g432L2lArmed)
+    {
+        G432Scope sc(&s_g432LGpu, g432L2lPx);
+        g289GpuCopy = g289TryGpuLocalCopy(m_vram, m_vramSize,
+                                          sbp, sbw, spsm, ssax, ssay,
+                                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    }
+    else
+    {
+        g289GpuCopy = g289TryGpuLocalCopy(m_vram, m_vramSize,
+                                          sbp, sbw, spsm, ssax, ssay,
+                                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    }
+
+    // G713: the escape census, at the one point where the GPU/CPU decision is already made.
+    if (g713L2lStatOn())
+        g713NoteL2l(g289GpuCopy, sbp, spsm, dbp, dpsm, rrw, rrh);
+
+    // G522: the blit was not taken, so the CPU copy below WILL read guest VRAM. Replay the
+    // publication the range barrier skipped. No-op on every other path.
+    if (!g289GpuCopy)
+        g144L2lLatePin();
+
+    {
+        G432Scope sc(g432L2lArmed ? &s_g432LHook : nullptr, g432L2lPx);
+        g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
+        // G178/G242: notify only after pending draws and source depth have been resolved.
+        // The hook materializes an overlapping GPU-owned destination before the CPU copy writes it.
+        {
+            extern void g178NoteVramWriteRectTagged(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                    uint32_t, uint32_t, uint32_t, uint32_t,
+                                                    uint32_t);
+            g178NoteVramWriteRectTagged(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                                        8u); // G582 source 8: local-to-local copy destination
+        }
+    }
+    if (g289GpuCopy)
+    {
+        if (g432L2lArmed)
+            ++s_g432LGpuTaken;
+        g627DiscardPendingL2lPatch(); // no CPU copy ran, so no VRAM bytes to reconcile
+        return; // exact logical write is versioned in fbp=0x13b's FBO
+    }
+
+    PS2_IF_AGRESSIVE_LOGS({
+        if ((spsm == GS_PSM_T4 || dpsm == GS_PSM_T4) &&
+            s_debugLocalCopyCount.fetch_add(1u, std::memory_order_relaxed) < 96u)
+        {
+            RUNTIME_LOG("[gs:l2l] sbp=" << sbp
+                                        << " dbp=" << dbp
+                                        << " sbw=" << static_cast<uint32_t>(sbw)
+                                        << " dbw=" << static_cast<uint32_t>(dbw)
+                                        << " spsm=0x" << std::hex << static_cast<uint32_t>(spsm)
+                                        << " dpsm=0x" << static_cast<uint32_t>(dpsm) << std::dec
+                                        << " ss=(" << ssax << "," << ssay << ")"
+                                        << " ds=(" << dsax << "," << dsay << ")"
+                                        << " rr=(" << rrw << "," << rrh << ")"
+                                        << " dir=" << static_cast<uint32_t>(m_trxpos.dir)
+                                        << " formatAware=" << (formatAware ? 1 : 0) << std::endl);
+        }
+    });
+
+    // G285 PROMOTION (2026-07-17): DEFAULT-ON with the native-renderer stack. A CT32 transfer
+    // whose source and destination both cover whole GS pages in the same FBW layout has an
+    // address-preserving one-to-one mapping: every 64x32 logical page occupies one contiguous
+    // 8192-byte physical page. When the physical spans are disjoint, traversal order is
+    // irrelevant, so page-sized memcpy calls are exactly equivalent to the per-pixel copy.
+    //
+    // All graph barriers, generation bumps, and downstream presentation hooks above still run.
+    // The rasterizer hook may prove a destructive destination and publish only its uncovered
+    // page-row; all other resident-target materialization remains unchanged.
+    // Fail closed on partial pages, shifted origins, unlike layouts, overlap, or VRAM wrap.
+    // Kill: DC2_G285_NO_L2L_PAGE_COPY=1. Positive flag remains accepted but is redundant.
+    static const bool s_g285PageCopyOn =
+        !envFlagEnabled("DC2_G285_NO_L2L_PAGE_COPY");
+    static const bool s_g285StatOn = envFlagEnabled("DC2_G285_STAT");
+    const uint64_t g285Bytes = static_cast<uint64_t>(rrw) *
+                               static_cast<uint64_t>(rrh) * 4ull;
+    const uint64_t g285SrcBase = static_cast<uint64_t>(sbp) * 256ull;
+    const uint64_t g285DstBase = static_cast<uint64_t>(dbp) * 256ull;
+    const uint64_t g285SrcEnd = g285SrcBase + g285Bytes;
+    const uint64_t g285DstEnd = g285DstBase + g285Bytes;
+    const bool g285Disjoint = g285SrcEnd <= g285DstBase || g285DstEnd <= g285SrcBase;
+    const bool g285Eligible =
+        formatAware &&
+        spsm == GS_PSM_CT32 &&
+        sbw == dbw &&
+        (sbp & 31u) == 0u &&
+        (dbp & 31u) == 0u &&
+        ssax == 0u && ssay == 0u &&
+        dsax == 0u && dsay == 0u &&
+        rrw == static_cast<uint32_t>(sbw) * 64u &&
+        (rrh & 31u) == 0u &&
+        g285SrcEnd <= static_cast<uint64_t>(m_vramSize) &&
+        g285DstEnd <= static_cast<uint64_t>(m_vramSize) &&
+        g285Disjoint;
+    const bool g285UsePageCopy = g260NrEnabled() && s_g285PageCopyOn && g285Eligible;
+    const auto g285BodyT0 = (s_g285StatOn && g285Eligible)
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+
+    // G432: charge the pixel body to one of three shape buckets (page memcpy / format-aware
+    // per-pixel / raw linear per-pixel). Scope closes at the end of the if/else chain below.
+    {
+    G432Scope g432Body(g432L2lArmed
+                           ? &s_g432LBody[g285UsePageCopy ? 0 : (formatAware ? 1 : 2)]
+                           : nullptr,
+                       g432L2lPx);
+    if (g285UsePageCopy)
+    {
+        // Keep each copy at one physical GS page. Besides mirroring the proof boundary, this
+        // avoids the CRT's large-copy streaming-store path: the destination is consumed again
+        // immediately by the renderer, so evicting/bypassing its cache lines can erase the
+        // transfer-body win in end-to-end timing.
+        constexpr size_t kG285PageBytes = 8192u;
+        const size_t pages = static_cast<size_t>(g285Bytes) / kG285PageBytes;
+        for (size_t page = 0; page < pages; ++page)
+        {
+            const size_t pageOff = page * kG285PageBytes;
+            std::memcpy(m_vram + static_cast<size_t>(g285DstBase) + pageOff,
+                        m_vram + static_cast<size_t>(g285SrcBase) + pageOff,
+                        kG285PageBytes);
+        }
+    }
+    else if (formatAware)
+    {
+        // G596: table-driven same-format body. One loop-invariant call-level branch; it fails
+        // CLOSED to the untouched legacy loop below on any shape it cannot reproduce exactly.
+        if (!g596TryFastLocalCopy(m_vram, m_vramSize,
+                                  sbp, static_cast<uint32_t>(sbw), spsm, ssax, ssay,
+                                  dbp, static_cast<uint32_t>(dbw), dpsm, dsax, dsay,
+                                  rrw, rrh, traversal.reverseX, traversal.reverseY))
+        {
+        for (uint32_t row = 0; row < rrh; ++row)
+        {
+            const uint32_t srcY = transferCoord(ssay, rrh, row, traversal.reverseY);
+            const uint32_t dstY = transferCoord(dsay, rrh, row, traversal.reverseY);
+            for (uint32_t col = 0; col < rrw; ++col)
+            {
+                const uint32_t srcX = transferCoord(ssax, rrw, col, traversal.reverseX);
+                const uint32_t dstX = transferCoord(dsax, rrw, col, traversal.reverseX);
+                const uint32_t pixel =
+                    readTransferPixel(m_vram, m_vramSize, sbp, sbw, spsm, srcX, srcY);
+                writeTransferPixel(m_vram, m_vramSize, dbp, dbw, dpsm, dstX, dstY, pixel);
+            }
+        }
+        }
+    }
+    else
+    {
+        const uint32_t srcBase = sbp * 256u;
+        const uint32_t dstBase = dbp * 256u;
+        uint32_t srcBpp = bitsPerPixel(spsm) / 8u;
+        uint32_t dstBpp = bitsPerPixel(dpsm) / 8u;
+        if (srcBpp == 0)
+            srcBpp = 4;
+        if (dstBpp == 0)
+            dstBpp = 4;
+        const uint32_t srcStride = static_cast<uint32_t>(sbw) * 64u * srcBpp;
+        const uint32_t dstStride = static_cast<uint32_t>(dbw) * 64u * dstBpp;
+        const uint32_t copyBpp = (srcBpp < dstBpp) ? srcBpp : dstBpp;
+
+        uint8_t pixelBytes[4] = {};
+        for (uint32_t row = 0; row < rrh; ++row)
+        {
+            const uint32_t srcY = transferCoord(ssay, rrh, row, traversal.reverseY);
+            const uint32_t dstY = transferCoord(dsay, rrh, row, traversal.reverseY);
+            for (uint32_t col = 0; col < rrw; ++col)
+            {
+                const uint32_t srcX = transferCoord(ssax, rrw, col, traversal.reverseX);
+                const uint32_t dstX = transferCoord(dsax, rrw, col, traversal.reverseX);
+                const uint32_t srcOff = srcBase + srcY * srcStride + srcX * srcBpp;
+                const uint32_t dstOff = dstBase + dstY * dstStride + dstX * dstBpp;
+                if (srcOff + copyBpp > m_vramSize || dstOff + copyBpp > m_vramSize)
+                {
+                    continue;
+                }
+
+                std::memcpy(pixelBytes, m_vram + srcOff, copyBpp);
+                std::memcpy(m_vram + dstOff, pixelBytes, copyBpp);
+            }
+        }
+    }
+    } // G432 body scope
+
+    // G627: guest VRAM now holds the copy's destination bytes. Reconcile exactly those byte lanes
+    // into the resident CT32 surface, which is why this edge was allowed to skip publishing it.
+    g627ApplyPendingL2lPatch(m_vram, m_vramSize);
+
+    if (s_g285StatOn)
+    {
+        const uint64_t calls =
+            g_g285L2lCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (g285Eligible)
+        {
+            const uint64_t bodyNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g285BodyT0).count());
+            g_g285L2lEligible.fetch_add(1u, std::memory_order_relaxed);
+            g_g285L2lBytes.fetch_add(g285Bytes, std::memory_order_relaxed);
+            if (g285UsePageCopy)
+            {
+                g_g285L2lFast.fetch_add(1u, std::memory_order_relaxed);
+                g_g285L2lFastNs.fetch_add(bodyNs, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_g285L2lLegacyNs.fetch_add(bodyNs, std::memory_order_relaxed);
+            }
+        }
+        if ((calls & 127u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G285:l2l] calls=%llu eligible=%llu fast=%llu bytes=%llu "
+                         "legacyMs=%.3f fastMs=%.3f\n",
+                         static_cast<unsigned long long>(calls),
+                         static_cast<unsigned long long>(
+                             g_g285L2lEligible.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             g_g285L2lFast.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             g_g285L2lBytes.load(std::memory_order_relaxed)),
+                         static_cast<double>(
+                             g_g285L2lLegacyNs.load(std::memory_order_relaxed)) / 1.0e6,
+                         static_cast<double>(
+                             g_g285L2lFastNs.load(std::memory_order_relaxed)) / 1.0e6);
+        }
+    }
+
+    if (sbp == 0u && (dbp == 0u || dbp == 0x20u) && rrw >= 640u && rrh >= 512u)
+    {
+        m_lastDisplayBaseBytes = (dbp == 0x20u) ? 8192u : 0u;
+        snapshotVRAM();
+    }
+}
+
+void GS::vertexKick(bool drawing)
+{
+    // G602: every default-off diagnostic that used to sit inline in this function now lives in
+    // g602_gif_cold_outline.inc behind a `__declspec(noinline)` helper. Before that move MSVC gave
+    // this function — called 24,569x per frame on `s05` — a prologue of 8 GPR pushes,
+    // `sub rsp,0x148` and NINE `movaps` spills of xmm6..xmm14, because the G65/G66/G14/G196 traces
+    // print floats. That is 17d §2.1's measured call-boundary class (G487: ~10 ns/call). The
+    // diagnostics are unchanged; only where their register pressure is accounted has moved.
+    if (G602_GATE_KICK_G196)
+    {
+        const GSContext &ctx196 = m_ctx[m_prim.ctxt & 1u];
+        // G200: log the freshly-written vertex position (the slot the caller just filled, before
+        // the count advances) so the runner's coords can be diffed against map_0.gs.
+        g602ColdKickG196(static_cast<uint32_t>(m_prim.type), m_prim.tme, ctx196.tex0.tbp0,
+                         ctx196.frame.fbp, drawing, m_vtxCount,
+                         m_vtxQueue[m_vtxCount % kMaxVerts]);
+    }
+
+    // G107 A/B: ADC is "drawing kick disabled". For title-rock strips, test the stricter
+    // interpretation that an ADC vertex must not advance the primitive queue either.
+    if (!drawing && G602_GATE_KICK_G107)
+    {
+        const GSContext &ctx = m_ctx[m_prim.ctxt & 1u];
+        if (g602ColdKickG107(static_cast<uint32_t>(m_prim.type), m_prim.tme, ctx.tex0.tbp0,
+                             ctx.frame.fbp, m_vtxCount))
+            return;
+    }
+
+    ++m_vtxCount;
+    ++m_vtxIndex;
+
+    PS2_IF_AGRESSIVE_LOGS({
+        const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
+        if (debugIndex < 96u)
+        {
+            RUNTIME_LOG("[gs:kick] idx=" << debugIndex
+                                         << " drawing=" << static_cast<uint32_t>(drawing ? 1u : 0u)
+                                         << " prim=" << static_cast<uint32_t>(m_prim.type)
+                                         << " vtxCount=" << m_vtxCount
+                                         << std::endl);
+        }
+    });
+
+    int needed = 0;
+    switch (m_prim.type)
+    {
+    case GS_PRIM_POINT:
+        needed = 1;
+        break;
+    case GS_PRIM_LINE:
+        needed = 2;
+        break;
+    case GS_PRIM_LINESTRIP:
+        needed = 2;
+        break;
+    case GS_PRIM_TRIANGLE:
+        needed = 3;
+        break;
+    case GS_PRIM_TRISTRIP:
+        needed = 3;
+        break;
+    case GS_PRIM_TRIFAN:
+        needed = 3;
+        break;
+    case GS_PRIM_SPRITE:
+        needed = 2;
+        break;
+    default:
+        return;
+    }
+
+    // [G123] ordered interleave: accumulate this tri-class kick into the current draw-run keyed
+    // by the bound TEX0; a tbp change flushes the run. Pairs with the BIND events above.
+    if (G602_GATE_KICK_G123)
+    {
+        const GSContext &ctx123 = m_ctx[m_prim.ctxt & 1u];
+        g602ColdKickG123(static_cast<uint32_t>(m_prim.type), m_prim.tme, ctx123.tex0.tbp0, drawing);
+    }
+
+    if (m_vtxCount < needed)
+        return;
+
+    // G65/G66/G14: per-prim-type and per-tbp draw/nodraw tallies plus the sampled coordinate
+    // traces. G602 moved the whole block out of line (g602_gif_cold_outline.inc) — it owns most of
+    // this function's nine nonvolatile XMM saves.
+    if (G602_GATE_KICK_G14)
+        g602ColdKickTrace(static_cast<uint32_t>(m_prim.type), m_prim.tme,
+                          m_ctx[m_prim.ctxt & 1u].tex0.tbp0, drawing, m_vtxCount,
+                          m_vtxQueue, kMaxVerts);
+
+    // G434 workload invariant: a ceiling probe that deletes draw submission is only admissible if
+    // both arms provably completed the same kicks. Behind the same cached master bool as the
+    // report, so the default path pays one predicted branch, not two atomics per vertex.
+    extern std::atomic<uint64_t> g_g434Kicks, g_g434DrawKicks;
+    if (G602_GATE_KICK_INV)
+    {
+        g_g434Kicks.fetch_add(1u, std::memory_order_relaxed);
+        if (drawing)
+            g_g434DrawKicks.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    if (drawing)
+    {
+        // G434 CEILING PROBE (DC2_G434_NO_DRAW=1, default-off, knowingly WRONG output):
+        // skip the entire front-thread primitive submission — deferral, tile-binning, GPU
+        // batching and CPU raster all vanish, while GIF parse, register replay, transfers and
+        // the vertex queue keep running identically. Prices "what if drawPrimitive cost zero".
+        if (!G602_GATE_KICK_NODRAW)
+        {
+            G147CountedPerfScope g147DrawScope(g_g147DrawPrimitiveNs, g_g147DrawPrimitiveCount);
+            m_rasterizer.drawPrimitive(this);
+        }
+    }
+
+    switch (m_prim.type)
+    {
+    case GS_PRIM_LINE:
+    case GS_PRIM_TRIANGLE:
+    case GS_PRIM_SPRITE:
+    case GS_PRIM_POINT:
+        m_vtxCount = 0;
+        break;
+    case GS_PRIM_LINESTRIP:
+        m_vtxQueue[0] = m_vtxQueue[1];
+        m_vtxCount = 1;
+        break;
+    case GS_PRIM_TRISTRIP:
+        m_vtxQueue[0] = m_vtxQueue[1];
+        m_vtxQueue[1] = m_vtxQueue[2];
+        m_vtxCount = 2;
+        break;
+    case GS_PRIM_TRIFAN:
+        m_vtxQueue[1] = m_vtxQueue[2];
+        m_vtxCount = 2;
+        break;
+    default:
+        m_vtxCount = 0;
+        break;
+    }
+}
+
+void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+{
+    G146PerfScope g146Scope(g_g146GsImageNs);
+    G654LayerScope g654Scope(kG654LayerGsImage); // G654 P17, empty in the default build
+    // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
+    {
+        extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
+        static const bool s_g219on = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219on)
+        {
+            static thread_local char s_g219tag[64];
+            std::snprintf(s_g219tag, sizeof(s_g219tag), "upload(dbp=0x%x dpsm=0x%x)",
+                          m_bitbltbuf.dbp, (unsigned)m_bitbltbuf.dpsm);
+            g219Sentinel(m_vram, m_vramSize, s_g219tag);
+        }
+    }
+
+    static const bool s_g145EnvDirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                             !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    const bool g145DirtyUpload = (g268LiveEnvRead()
+                                      ? (envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                         !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD"))
+                                      : s_g145EnvDirtyUpload) ||
+                                 g260NrEnabled();
+    if (!g145DirtyUpload)
+        g144FlushPendingUpload();
+
+    // G145 opt-in: the deferred-triangle upload barrier is range-checked after host-to-local is confirmed.
+    if (renderQualityTraceEnabled())
+    {
+        static std::atomic<int> s_f37PidEntry{0};
+        const int n = s_f37PidEntry.fetch_add(1, std::memory_order_relaxed);
+        const bool isT4HH = (m_bitbltbuf.dpsm == GS_PSM_T4HH || m_bitbltbuf.dpsm == GS_PSM_T4HL);
+        // F50.9: also surface the dungeon paletted-texture/CLUT uploads (PSMT4=0x14,
+        // PSMT8=0x13, and PSMCT32 CLUTs with dbw==1) which arrive after the first 24
+        // (all-T4HH/title) calls, so we can confirm processImageData actually runs for them.
+        const bool isDungeonShaped = (m_bitbltbuf.dpsm == GS_PSM_T4 ||
+                                      m_bitbltbuf.dpsm == GS_PSM_T8 ||
+                                      (m_bitbltbuf.dpsm == GS_PSM_CT32 && m_bitbltbuf.dbw == 1u));
+        static std::atomic<int> s_f37PidDng{0};
+        const int dng = isDungeonShaped ? s_f37PidDng.fetch_add(1, std::memory_order_relaxed) : 0;
+        if (n < 24 || isT4HH || (isDungeonShaped && dng < 48))
+        {
+            uint32_t nz = 0;
+            const uint32_t cap = std::min<uint32_t>(sizeBytes, 256u);
+            for (uint32_t i = 0; i < cap; ++i) if (data[i]) ++nz;
+            std::fprintf(stderr, "[F37:pid] n=%d trxdir=%u dpsm=0x%x dbp=0x%x dbw=%u rr=(%u,%u) bytes=%u nz=%u pending=%u\n",
+                n, m_trxdir, (unsigned)m_bitbltbuf.dpsm, m_bitbltbuf.dbp, (unsigned)m_bitbltbuf.dbw,
+                m_trxreg.rrw, m_trxreg.rrh, sizeBytes, nz, s_pendingImageBytes);
+        }
+    }
+    // G365 (diagnostic, default-off): every host->local upload whose destination block lands
+    // inside the scene RTT's page range (fbp 0x139 = blocks 0x2720..0x3420) or the display
+    // buffer's (fbp 0x68 = blocks 0xd00..0x1a00). The MAP-160 right-edge line is frozen VRAM,
+    // so an upload landing in the RTT's last page column is a prime suspect.
+    {
+        static const bool s_g365u = (std::getenv("DC2_G365_WATCH") != nullptr);
+        if (s_g365u)
+        {
+            const uint32_t dbp = m_bitbltbuf.dbp;
+            const bool inRtt = (dbp >= 0x2720u && dbp < 0x3420u);
+            const bool inDisp = (dbp >= 0x0d00u && dbp < 0x1a00u);
+            if (inRtt || inDisp)
+            {
+                static std::atomic<uint32_t> s_g365un{0};
+                const uint32_t un = s_g365un.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (un <= 120u || (un % 500u) == 0u)
+                    std::fprintf(stderr,
+                        "[G365:up] n=%u where=%s dbp=0x%x dbw=%u dpsm=0x%x dsa=(%u,%u) rr=%ux%u bytes=%u\n",
+                        un, inRtt ? "rtt" : "disp", dbp, (unsigned)m_bitbltbuf.dbw,
+                        (unsigned)m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                        m_trxreg.rrw, m_trxreg.rrh, sizeBytes);
+            }
+        }
+    }
+    if (m_trxdir != 0 || !m_vram)
+        return;
+
+    static const bool s_g313Census = envFlagEnabled("DC2_G313_CENSUS");
+    struct G313ImageSegStat
+    {
+        uint64_t calls = 0u;
+        uint64_t rangeNs = 0u;
+        uint64_t genNs = 0u;
+        uint64_t bumpNs = 0u;
+        uint64_t prewriterNs = 0u;
+        uint64_t writerNs = 0u;
+        uint64_t commitNs = 0u;
+    };
+    static thread_local G313ImageSegStat s_g313Seg{};
+    std::chrono::steady_clock::time_point g313StepT0;
+
+    // G145: flush only if this upload overlaps a pending deferred draw's texture/CLUT/target.
+    if (s_g313Census)
+        g313StepT0 = std::chrono::steady_clock::now();
+    if (g145DirtyUpload)
+        g144FlushPendingUploadRange(m_bitbltbuf.dbp,
+                                    m_bitbltbuf.dbw,
+                                    m_bitbltbuf.dpsm,
+                                    m_trxpos.dsax,
+                                    m_trxpos.dsay,
+                                    m_trxreg.rrw,
+                                    m_trxreg.rrh);
+    if (s_g313Census)
+    {
+        s_g313Seg.rangeNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        g313StepT0 = std::chrono::steady_clock::now();
+    }
+
+    g149BumpVramGen(); // host-to-local upload about to write VRAM: invalidate the texture cache
+    if (s_g313Census)
+    {
+        s_g313Seg.genNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        g313StepT0 = std::chrono::steady_clock::now();
+    }
+    // G178/G242: notify only after the pending-draw barrier above has established GS order.
+    {
+        extern void g178NoteVramWriteRectTagged(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, uint32_t, uint32_t,
+                                                uint32_t);
+        g178NoteVramWriteRectTagged(m_vram, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                    m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
+                                    9u); // G582 source 9: host->local IMAGE upload
+        // G709 §3: snapshot this transfer's pages BEFORE the write loop runs. Default OFF
+        // (DC2_G709_IMGCENSUS=1); the paired `after` call is at the end of the writer.
+        extern void g709NoteImageWritePages(const uint8_t *, uint32_t, uint32_t, uint32_t,
+                                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                            bool);
+        g709NoteImageWritePages(m_vram, m_vramSize, m_bitbltbuf.dbp, m_bitbltbuf.dbw,
+                                m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                                m_trxreg.rrw, m_trxreg.rrh, false);
+    }
+    if (s_g313Census)
+    {
+        s_g313Seg.bumpNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        g313StepT0 = std::chrono::steady_clock::now();
+    }
+    // [G37:seq] GS-order trace of writes to the 0x2720 work page (uploads), shared with the
+    // rasterizer's RTT-draw + composite events, to pin what clobbers the model RTT before the
+    // display composite samples it. Gated by DC2_G37_SEQ.
+    if (g_g37_seq_trace && g_g37_armed.load(std::memory_order_relaxed) == 1 &&
+        m_bitbltbuf.dbp >= 0x2700u && m_bitbltbuf.dbp <= 0x2740u)
+    {
+        const uint32_t s = g_g37_seq.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (s <= 120u)
+        {
+            std::fprintf(stderr, "[G37:seq] s=%u UPLOAD dbp=0x%x dbw=%u dpsm=0x%x rr=(%u,%u) bytes=%u\n",
+                         s, m_bitbltbuf.dbp, (unsigned)m_bitbltbuf.dbw, (unsigned)m_bitbltbuf.dpsm,
+                         m_trxreg.rrw, m_trxreg.rrh, sizeBytes);
+            std::fflush(stderr);
+        }
+    }
+
+    uint32_t dbp = m_bitbltbuf.dbp;
+    uint8_t dbw = m_bitbltbuf.dbw;
+    uint8_t dpsm = m_bitbltbuf.dpsm;
+
+    // G2: capture the raw host->local source bytes for the font/banner pages so the
+    // CT32-alias upload + T8 read swizzle can be solved offline. DC2_DUMP_FONTSRC=1.
+    {
+        static const bool s_dumpSrc = []() {
+            const char *e = std::getenv("DC2_DUMP_FONTSRC");
+            return e && e[0] != '0';
+        }();
+        if (s_dumpSrc && (dbp == 0x2720u || dbp == 0x2f20u || dbp == 0x3220u) && sizeBytes != 0u)
+        {
+            static std::atomic<int> s_n2720{0}, s_n2f20{0}, s_n3220{0};
+            std::atomic<int> *cnt = (dbp == 0x2720u) ? &s_n2720 : (dbp == 0x2f20u) ? &s_n2f20 : &s_n3220;
+            int idx = cnt->fetch_add(1, std::memory_order_relaxed);
+            if (idx < 8)
+            {
+                char p[128];
+                std::snprintf(p, sizeof(p), "captures/src_%x_%d_dbw%u_rr%ux%u_ds%ux%u.bin",
+                              dbp, idx, (unsigned)dbw, m_trxreg.rrw, m_trxreg.rrh, m_trxpos.dsax, m_trxpos.dsay);
+                FILE *fp = std::fopen(p, "wb");
+                if (fp) { std::fwrite(data, 1, sizeBytes, fp); std::fclose(fp); }
+                std::fprintf(stderr, "[G2:srcdump] %s bytes=%u dpsm=0x%x\n", p, sizeBytes, (unsigned)dpsm);
+            }
+        }
+    }
+
+    if (dbw == 0)
+        dbw = 1;
+    uint32_t base = dbp * 256u;
+    uint32_t bpp = bitsPerPixel(dpsm);
+    uint32_t stridePixels = static_cast<uint32_t>(dbw) * 64u;
+
+    uint32_t rrw = m_trxreg.rrw;
+    uint32_t rrh = m_trxreg.rrh;
+    uint32_t dsax = m_trxpos.dsax;
+    uint32_t dsay = m_trxpos.dsay;
+
+    // G155 (perf, bit-exact): the upload-preview candidate below (this full-buffer nonzero scan
+    // plus, for CT* uploads, a 512x448x4 RGBA assign+copy) is consumed ONLY by the default-off host
+    // upload-preview fallback (uploadPresentationFallbackEnabled -> the [F31:upload-present] latch)
+    // and by DC2_PHASE_TRACE traces. It never touches VRAM. In the normal render path it is pure
+    // dead work — the title streams ~1.9 MB of host->local image data/frame, so this scan alone is a
+    // ~1.9M byte compares/frame tax on the (MTGS worker) upload budget for no visible effect. Skip
+    // the scan unless a consumer is active; nonzeroBytes then stays 0 so the candidate block below is
+    // naturally skipped (bit-exact). Kill switch DC2_G155_NO_SKIP_PREVIEW forces the old scan.
+    uint32_t nonzeroBytes = 0u;
+    static const bool s_g155PreviewNeeded =
+        uploadPresentationFallbackEnabled() || phaseDiagnosticsEnabled() ||
+        envFlagEnabled("DC2_G155_NO_SKIP_PREVIEW");
+    if (s_g155PreviewNeeded)
+    {
+        for (uint32_t i = 0; i < sizeBytes; ++i)
+        {
+            if (data[i] != 0u)
+                ++nonzeroBytes;
+        }
+    }
+
+    if (nonzeroBytes != 0u && isHostPresentableUploadPsm(dpsm) && rrw != 0u && rrh != 0u)
+    {
+        const uint32_t candidateWidth = std::min<uint32_t>(rrw, kHostFrameWidth);
+        const uint32_t candidateHeight = std::min<uint32_t>(rrh, kHostFrameHeight);
+        const uint64_t candidateScore =
+            static_cast<uint64_t>(candidateWidth) *
+            static_cast<uint64_t>(candidateHeight) *
+            static_cast<uint64_t>(nonzeroBytes);
+        if (!s_f31UploadPresentationCandidate.valid ||
+            candidateScore > s_f31UploadPresentationCandidate.score)
+        {
+            s_f31UploadPresentationCandidate.valid = true;
+            s_f31UploadPresentationCandidate.frame.fbp = dbp;
+            s_f31UploadPresentationCandidate.frame.fbw = dbw;
+            s_f31UploadPresentationCandidate.frame.psm = dpsm;
+            s_f31UploadPresentationCandidate.frame.fbmsk = 0u;
+            s_f31UploadPresentationCandidate.width = candidateWidth;
+            s_f31UploadPresentationCandidate.height = candidateHeight;
+            s_f31UploadPresentationCandidate.sourceOriginX = dsax;
+            s_f31UploadPresentationCandidate.sourceOriginY = dsay;
+            s_f31UploadPresentationCandidate.nonzeroBytes = nonzeroBytes;
+            s_f31UploadPresentationCandidate.score = candidateScore;
+            s_f31UploadPresentationCandidate.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+
+            if (dpsm == GS_PSM_CT32)
+            {
+                for (uint32_t y = 0u; y < candidateHeight; ++y)
+                {
+                    uint8_t *dstRow = s_f31UploadPresentationCandidate.pixels.data() + (y * kHostFrameWidth * 4u);
+                    for (uint32_t x = 0u; x < candidateWidth; ++x)
+                    {
+                        const uint32_t srcOff = (y * rrw + x) * 4u;
+                        if (srcOff + 4u > sizeBytes)
+                            break;
+                        dstRow[x * 4u + 0u] = data[srcOff + 0u];
+                        dstRow[x * 4u + 1u] = data[srcOff + 1u];
+                        dstRow[x * 4u + 2u] = data[srcOff + 2u];
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+                }
+            }
+            else if (dpsm == GS_PSM_CT24)
+            {
+                for (uint32_t y = 0u; y < candidateHeight; ++y)
+                {
+                    uint8_t *dstRow = s_f31UploadPresentationCandidate.pixels.data() + (y * kHostFrameWidth * 4u);
+                    for (uint32_t x = 0u; x < candidateWidth; ++x)
+                    {
+                        const uint32_t srcOff = (y * rrw + x) * 3u;
+                        if (srcOff + 3u > sizeBytes)
+                            break;
+                        dstRow[x * 4u + 0u] = data[srcOff + 0u];
+                        dstRow[x * 4u + 1u] = data[srcOff + 1u];
+                        dstRow[x * 4u + 2u] = data[srcOff + 2u];
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+                }
+            }
+            else if (dpsm == GS_PSM_CT16 || dpsm == GS_PSM_CT16S)
+            {
+                for (uint32_t y = 0u; y < candidateHeight; ++y)
+                {
+                    uint8_t *dstRow = s_f31UploadPresentationCandidate.pixels.data() + (y * kHostFrameWidth * 4u);
+                    for (uint32_t x = 0u; x < candidateWidth; ++x)
+                    {
+                        const uint32_t srcOff = (y * rrw + x) * 2u;
+                        if (srcOff + sizeof(uint16_t) > sizeBytes)
+                            break;
+                        uint16_t pixel = 0u;
+                        std::memcpy(&pixel, data + srcOff, sizeof(pixel));
+                        const uint32_t r = pixel & 31u;
+                        const uint32_t g = (pixel >> 5) & 31u;
+                        const uint32_t b = (pixel >> 10) & 31u;
+                        dstRow[x * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
+                        dstRow[x * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
+                        dstRow[x * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+                }
+            }
+
+            if (phaseDiagnosticsEnabled())
+            {
+                static std::atomic<uint32_t> s_f31UploadCandidateCount{0};
+                const uint32_t n = s_f31UploadCandidateCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 16u || (n % 64u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[F31:upload-candidate] n=%u dbp=0x%x dbw=%u psm=0x%x size=(%u,%u) ds=(%u,%u) nonzero=%u score=%llu\n",
+                                 n,
+                                 dbp,
+                                 static_cast<uint32_t>(dbw),
+                                 static_cast<uint32_t>(dpsm),
+                                 candidateWidth,
+                                 candidateHeight,
+                                 dsax,
+                                 dsay,
+                                 nonzeroBytes,
+                                 static_cast<unsigned long long>(candidateScore));
+                }
+            }
+        }
+    }
+
+    if (phaseDiagnosticsEnabled() && sizeBytes != 0u)
+    {
+        static std::atomic<uint32_t> s_f31ImageWriteCount{0};
+        const uint32_t n = s_f31ImageWriteCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 64u || (n % 256u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[F31:imgwrite] n=%u bytes=%u nonzero=%u dbp=0x%x dbw=%u dpsm=0x%x rr=(%u,%u) ds=(%u,%u) hw=(%u,%u)\n",
+                         n, sizeBytes, nonzeroBytes, dbp, static_cast<uint32_t>(dbw),
+                         static_cast<uint32_t>(dpsm), rrw, rrh, dsax, dsay,
+                         m_hwregX, m_hwregY);
+        }
+    }
+
+    if (s_g313Census)
+    {
+        s_g313Seg.prewriterNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+    }
+
+    // G313 premise census: time only the serial IMAGE writer below, after every ordering
+    // barrier, diagnostic preview, and pending-graph drain. Keep this independent of DC2_PERF;
+    // G312 proved that coarse hot-path instrumentation can manufacture a false pole term.
+    struct G313ImagePsmStat
+    {
+        uint64_t calls = 0u;
+        uint64_t bytes = 0u;
+        uint64_t ns = 0u;
+        uint64_t shapeCalls[4]{}; // mid-row, row-start partial, whole rows, whole aligned blocks
+        uint64_t shapeBytes[4]{};
+        uint64_t shapeNs[4]{};
+    };
+    static thread_local G313ImagePsmStat s_g313Psm[64]{};
+    static thread_local uint64_t s_g313Calls = 0u;
+    const uint32_t g313EntryX = m_hwregX;
+    const uint32_t g313EntryY = m_hwregY;
+    uint32_t g313Shape = 0u;
+    std::chrono::steady_clock::time_point g313T0;
+    if (s_g313Census)
+    {
+        uint32_t blockW = 1u;
+        uint32_t blockH = 1u;
+        switch (dpsm)
+        {
+        case GS_PSM_CT32:
+        case GS_PSM_CT24:
+        case GS_PSM_Z32:
+        case GS_PSM_Z24:
+        case GS_PSM_T8H:
+        case GS_PSM_T4HL:
+        case GS_PSM_T4HH:
+            blockW = 8u;
+            blockH = 8u;
+            break;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            blockW = 16u;
+            blockH = 8u;
+            break;
+        case GS_PSM_T8:
+            blockW = 16u;
+            blockH = 16u;
+            break;
+        case GS_PSM_T4:
+            blockW = 32u;
+            blockH = 16u;
+            break;
+        default:
+            break;
+        }
+
+        uint64_t payloadPixels = 0u;
+        if (dpsm == GS_PSM_T4 || dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH)
+            payloadPixels = static_cast<uint64_t>(sizeBytes) * 2u;
+        else if (dpsm == GS_PSM_CT24 || dpsm == GS_PSM_Z24)
+            payloadPixels = sizeBytes / 3u;
+        else
+        {
+            const uint32_t transferBytesPerPixel = std::max<uint32_t>(1u, bpp / 8u);
+            payloadPixels = sizeBytes / transferBytesPerPixel;
+        }
+
+        const uint64_t rowsLeft = (g313EntryY < rrh) ? (rrh - g313EntryY) : 0u;
+        const uint64_t pixelsLeft = rowsLeft * rrw -
+                                    ((rowsLeft != 0u && g313EntryX < rrw) ? g313EntryX : 0u);
+        payloadPixels = std::min<uint64_t>(payloadPixels, pixelsLeft);
+        if (g313EntryX == 0u)
+        {
+            g313Shape = 1u;
+            if (rrw != 0u && payloadPixels >= rrw && (payloadPixels % rrw) == 0u)
+            {
+                g313Shape = 2u;
+                const uint64_t rowCount = payloadPixels / rrw;
+                if (((dsax % blockW) == 0u) && ((rrw % blockW) == 0u) &&
+                    (((dsay + g313EntryY) % blockH) == 0u) &&
+                    ((rowCount % blockH) == 0u))
+                {
+                    g313Shape = 3u;
+                }
+            }
+        }
+        g313T0 = std::chrono::steady_clock::now();
+    }
+
+    // G424: hand the swizzled writer whole horizontal runs instead of one cross-TU call per pixel.
+    // Exact by construction (same PixelStorageTraits<psm>::Write calls, same arguments, same
+    // order); only the call boundary moves. Uncovered psm returns false and falls through to the
+    // untouched legacy tree below. See g424_fast_image_upload.inc.
+    bool g424Handled = false;
+    if (g424FastImageOn())
+    {
+        const G424ImageCtx g424Ctx{m_vram, data, sizeBytes, dbp, dbw, dpsm,
+                                   dsax, dsay, rrw, rrh, &m_hwregX, &m_hwregY};
+        if (g424VerifyOn() && g424VerifySampleNow())
+        {
+            // Oracle: run the fast arm, capture its result, rewind GS memory and the transfer
+            // cursor, let the legacy tree run from the identical pre-state, then compare.
+            g424VerifyBegin(m_vram, m_vramSize, m_hwregX, m_hwregY);
+            if (g424TryFastImageWrite(g424Ctx))
+                g424VerifyRewind(m_vram, m_vramSize, m_hwregX, m_hwregY);
+            else
+                s_g424VerPending = false;
+        }
+        else
+        {
+            g424Handled = g424TryFastImageWrite(g424Ctx);
+        }
+        if (g424StatOn())
+        {
+            const uint64_t n = g_g424Calls.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+            if (g424Handled)
+                g_g424Fast.fetch_add(1ull, std::memory_order_relaxed);
+            if ((n % 8192ull) == 0ull)
+                std::fprintf(stderr, "[G424:stat] imageCalls=%llu run=%llu legacy=%llu\n",
+                             (unsigned long long)n,
+                             (unsigned long long)g_g424Fast.load(std::memory_order_relaxed),
+                             (unsigned long long)(n - g_g424Fast.load(std::memory_order_relaxed)));
+        }
+    }
+    if (!g424Handled)
+    {
+
+    if (dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH)
+    {
+        // G446: read once (G268 idiom) — same literal, same defect class as the per-texel site in
+        // rasterizer_write_pixel.inc; this one is per upload rather than per texel.
+        static const bool s_g5DumpFontUp = envFlagEnabled("DC2_DUMP_FONT");
+        if (dpsm == GS_PSM_T4HH && dbp == 0x1A00u && s_g5DumpFontUp)
+        {
+            static uint32_t s_g5SourceBytes = 0u;
+            const uint32_t sourceBytes = (rrw * rrh + 1u) / 2u;
+            if (s_g5SourceBytes < sourceBytes)
+            {
+                const uint32_t bytesToWrite = std::min<uint32_t>(sizeBytes, sourceBytes - s_g5SourceBytes);
+                FILE *fp = std::fopen("captures/font4hh_source.bin",
+                                      (s_g5SourceBytes == 0u) ? "wb" : "ab");
+                if (fp)
+                {
+                    std::fwrite(data, 1, bytesToWrite, fp);
+                    std::fclose(fp);
+                }
+                s_g5SourceBytes += bytesToWrite;
+                std::fprintf(stderr, "[G5:font4hh-src] wrote=%u total=%u expected=%u\n",
+                             bytesToWrite, s_g5SourceBytes, sourceBytes);
+            }
+        }
+
+        if (renderQualityTraceEnabled())
+        {
+            static std::atomic<int> s_f37T4hhCount{0};
+            const int n = s_f37T4hhCount.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16)
+            {
+                uint32_t nz = 0;
+                for (uint32_t i = 0; i < sizeBytes; ++i) if (data[i]) ++nz;
+                std::fprintf(stderr, "[F37:t4hh-write] call=%d dpsm=0x%x dbp=0x%x dbw=%u bytes=%u nonzero=%u hwx=%u hwy=%u rrw=%u rrh=%u\n",
+                    n, static_cast<uint32_t>(dpsm), dbp, static_cast<uint32_t>(dbw),
+                    sizeBytes, nz, m_hwregX, m_hwregY, rrw, rrh);
+            }
+        }
+        // Host-to-local transfers use the format's transfer bpp. T4HL/T4HH are packed
+        // 4-bit streams even though their destination nibble aliases a CT32 word.
+        auto writeT4Nibble = [&](uint8_t nibble)
+        {
+            if (m_hwregY >= rrh)
+                return;
+
+            if (dpsm == GS_PSM_T4HH)
+            {
+                GSMem::WriteP4HH(m_vram, dbp, dbw, dsax + m_hwregX, dsay + m_hwregY,
+                                 static_cast<uint32_t>(nibble & 0x0Fu));
+            }
+            else
+            {
+                GSMem::WriteP4HL(m_vram, dbp, dbw, dsax + m_hwregX, dsay + m_hwregY,
+                                 static_cast<uint32_t>(nibble & 0x0Fu));
+            }
+
+            ++m_hwregX;
+            if (m_hwregX >= rrw)
+            {
+                m_hwregX = 0;
+                ++m_hwregY;
+            }
+        };
+
+        uint32_t offset = 0;
+        while (offset < sizeBytes && m_hwregY < rrh)
+        {
+            const uint8_t srcByte = data[offset++];
+            const uint32_t xBefore = m_hwregX;
+
+            writeT4Nibble(static_cast<uint8_t>(srcByte & 0x0Fu));
+            if ((xBefore + 1u) < rrw && m_hwregY < rrh)
+            {
+                writeT4Nibble(static_cast<uint8_t>((srcByte >> 4u) & 0x0Fu));
+            }
+        }
+    }
+    else if (bpp == 4)
+    {
+        // F62 (PR #132): PSMT4 upload via the GSMem swizzle module. GSMem takes the
+        // buffer width in PAGES; PSMT4 pages are 128 wide, so pass dbw>>1 (the same
+        // halving the local GSPSMT4::addrPSMT4 did internally) — byte-identical.
+        const uint32_t pageBwT4 = ((static_cast<uint32_t>(dbw) >> 1u) != 0u)
+                                      ? (static_cast<uint32_t>(dbw) >> 1u)
+                                      : 1u;
+        auto writeT4Nibble = [&](uint8_t nibble)
+        {
+            if (m_hwregY >= rrh)
+                return;
+            GSMem::WriteP4(m_vram, dbp, pageBwT4, dsax + m_hwregX, dsay + m_hwregY,
+                           static_cast<uint32_t>(nibble & 0x0Fu));
+            ++m_hwregX;
+            if (m_hwregX >= rrw)
+            {
+                m_hwregX = 0;
+                ++m_hwregY;
+            }
+        };
+
+        uint32_t offset = 0;
+        while (offset < sizeBytes && m_hwregY < rrh)
+        {
+            const uint8_t srcByte = data[offset++];
+            const uint32_t srcLo = srcByte & 0x0Fu;
+            const uint32_t srcHi = (srcByte >> 4) & 0x0Fu;
+            const uint32_t xBefore = m_hwregX;
+
+            writeT4Nibble(static_cast<uint8_t>(srcLo));
+            if ((xBefore + 1u) < rrw && m_hwregY < rrh)
+            {
+                writeT4Nibble(static_cast<uint8_t>(srcHi));
+            }
+        }
+    }
+    else if (dpsm == GS_PSM_T8)
+    {
+        // F62 (PR #132): PSMT8 upload via GSMem. PSMT8 pages are 128 wide → dbw>>1
+        // (same halving GSPSMT8::addrPSMT8 did internally) — byte-identical.
+        const uint32_t pageBwT8 = ((static_cast<uint32_t>(dbw) >> 1u) != 0u)
+                                      ? (static_cast<uint32_t>(dbw) >> 1u)
+                                      : 1u;
+        uint32_t offset = 0;
+        while (offset < sizeBytes && m_hwregY < rrh)
+        {
+            uint32_t pixelsLeft = rrw - m_hwregX;
+            uint32_t pixelsToCopy = std::min<uint32_t>(pixelsLeft, sizeBytes - offset);
+            if (pixelsToCopy == 0)
+            {
+                break;
+            }
+
+            for (uint32_t i = 0; i < pixelsToCopy; ++i)
+            {
+                const uint32_t vx = dsax + m_hwregX + i;
+                const uint32_t vy = dsay + m_hwregY;
+                GSMem::WriteP8(m_vram, dbp, pageBwT8, vx, vy,
+                               static_cast<uint32_t>(data[offset + i]));
+            }
+
+            offset += pixelsToCopy;
+            m_hwregX += pixelsToCopy;
+            if (m_hwregX >= rrw)
+            {
+                m_hwregX = 0;
+                ++m_hwregY;
+            }
+        }
+    }
+    else if (dpsm == GS_PSM_CT24 || dpsm == GS_PSM_Z24)
+    {
+        // F62 (PR #132): 24-bit upload via GSMem. CT24/Z24 share the 32-bit page
+        // layout, so write through WriteCT32 (GSMem CT32 == local addrPSMCT32) and
+        // keep the pre-F62 quirk of storing alpha=0x80 in the unused upper byte.
+        const uint32_t pageBw24 = (static_cast<uint32_t>(dbw) != 0u)
+                                      ? static_cast<uint32_t>(dbw)
+                                      : 1u;
+        uint32_t transferBpp = 3;
+
+        uint32_t offset = 0;
+        while (offset < sizeBytes && m_hwregY < rrh)
+        {
+            uint32_t pixelsLeft = rrw - m_hwregX;
+            uint32_t srcBytesLeft = pixelsLeft * transferBpp;
+            uint32_t bytesAvail = sizeBytes - offset;
+            uint32_t pixelsToCopy = pixelsLeft;
+            if (srcBytesLeft > bytesAvail)
+                pixelsToCopy = bytesAvail / transferBpp;
+
+            if (pixelsToCopy == 0)
+                break;
+
+            for (uint32_t p = 0; p < pixelsToCopy; ++p)
+            {
+                const uint32_t vx = dsax + m_hwregX + p;
+                const uint32_t vy = dsay + m_hwregY;
+                const uint32_t c = static_cast<uint32_t>(data[offset + p * 3u + 0u]) |
+                                   (static_cast<uint32_t>(data[offset + p * 3u + 1u]) << 8u) |
+                                   (static_cast<uint32_t>(data[offset + p * 3u + 2u]) << 16u) |
+                                   (0x80u << 24u);
+                GSMem::WriteCT32(m_vram, dbp, pageBw24, vx, vy, c);
+            }
+
+            offset += pixelsToCopy * transferBpp;
+            m_hwregX += pixelsToCopy;
+            if (m_hwregX >= rrw)
+            {
+                m_hwregX = 0;
+                ++m_hwregY;
+            }
+        }
+    }
+    else
+    {
+        // F62 (PR #132): remaining formats via GSMem. CT32/Z32 were already swizzled
+        // (GSMem CT32/Z32 == local addrPSMCT32, byte-identical). The 16-bit family
+        // (CT16/CT16S/Z16/Z16S) was previously written LINEARLY here while the sampler
+        // reads it SWIZZLED — GSMem now swizzles the upload so the two agree. T8H stores
+        // the index in the upper byte of a 32-bit word. Unknown psm keeps the old linear
+        // copy as a safety fallback.
+        const uint32_t pageBwOther = (static_cast<uint32_t>(dbw) != 0u)
+                                         ? static_cast<uint32_t>(dbw)
+                                         : 1u;
+        uint32_t bytesPerPixel = bpp / 8u;
+        if (bytesPerPixel == 0)
+            bytesPerPixel = 4;
+        uint32_t strideBytes = stridePixels * bytesPerPixel;
+
+        uint32_t offset = 0;
+        while (offset < sizeBytes && m_hwregY < rrh)
+        {
+            uint32_t dstY = dsay + m_hwregY;
+            uint32_t pixelsLeft = rrw - m_hwregX;
+            uint32_t bytesLeft = pixelsLeft * bytesPerPixel;
+            uint32_t bytesAvail = sizeBytes - offset;
+            if (bytesLeft > bytesAvail)
+                bytesLeft = (bytesAvail / bytesPerPixel) * bytesPerPixel;
+
+            uint32_t pixelsCopied = bytesLeft / bytesPerPixel;
+
+            for (uint32_t p = 0; p < pixelsCopied; ++p)
+            {
+                const uint32_t vx = dsax + m_hwregX + p;
+                const uint32_t vy = dstY;
+                const uint8_t *src = data + offset + p * bytesPerPixel;
+                switch (dpsm)
+                {
+                case GS_PSM_CT32:
+                {
+                    uint32_t c; std::memcpy(&c, src, 4u);
+                    GSMem::WriteCT32(m_vram, dbp, pageBwOther, vx, vy, c);
+                    break;
+                }
+                case GS_PSM_Z32:
+                {
+                    uint32_t c; std::memcpy(&c, src, 4u);
+                    GSMem::WriteZ32(m_vram, dbp, pageBwOther, vx, vy, c);
+                    break;
+                }
+                case GS_PSM_CT16:
+                {
+                    uint16_t c; std::memcpy(&c, src, 2u);
+                    GSMem::WriteCT16(m_vram, dbp, pageBwOther, vx, vy, c);
+                    break;
+                }
+                case GS_PSM_CT16S:
+                {
+                    uint16_t c; std::memcpy(&c, src, 2u);
+                    GSMem::WriteCT16S(m_vram, dbp, pageBwOther, vx, vy, c);
+                    break;
+                }
+                case GS_PSM_Z16:
+                {
+                    uint16_t c; std::memcpy(&c, src, 2u);
+                    GSMem::WriteZ16(m_vram, dbp, pageBwOther, vx, vy, c);
+                    break;
+                }
+                case GS_PSM_Z16S:
+                {
+                    uint16_t c; std::memcpy(&c, src, 2u);
+                    GSMem::WriteZ16S(m_vram, dbp, pageBwOther, vx, vy, c);
+                    break;
+                }
+                case GS_PSM_T8H:
+                    GSMem::WriteP8H(m_vram, dbp, pageBwOther, vx, vy,
+                                    static_cast<uint32_t>(src[0]));
+                    break;
+                default:
+                {
+                    const uint32_t dstOff = base + vy * strideBytes +
+                                            (dsax + m_hwregX + p) * bytesPerPixel;
+                    if (dstOff + bytesPerPixel <= m_vramSize)
+                        std::memcpy(m_vram + dstOff, src, bytesPerPixel);
+                    break;
+                }
+                }
+            }
+
+            offset += bytesLeft;
+            m_hwregX += pixelsCopied;
+            if (m_hwregX >= rrw)
+            {
+                m_hwregX = 0;
+                ++m_hwregY;
+            }
+
+            if (bytesLeft == 0)
+                break;
+        }
+    }
+
+    } // G424: end of the legacy per-pixel writer tree
+
+    // G709 §3: the paired `after` half of the page-identity census. Default OFF
+    // (DC2_G709_IMGCENSUS=1). Placed after EVERY writer arm, including the G424 fast path, so the
+    // fraction it reports is the fraction for the transfer as actually executed.
+    {
+        extern void g709NoteImageWritePages(const uint8_t *, uint32_t, uint32_t, uint32_t,
+                                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                            bool);
+        g709NoteImageWritePages(m_vram, m_vramSize, m_bitbltbuf.dbp, m_bitbltbuf.dbw,
+                                m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                                m_trxreg.rrw, m_trxreg.rrh, true);
+    }
+
+    if (s_g424VerPending)
+        g424VerifyCompare(m_vram, m_vramSize, m_hwregX, m_hwregY,
+                          dpsm, dbp, dbw, rrw, rrh, sizeBytes);
+
+    if (s_g313Census)
+    {
+        const uint64_t elapsedNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313T0).count());
+        G313ImagePsmStat &stat = s_g313Psm[dpsm & 0x3fu];
+        ++stat.calls;
+        stat.bytes += sizeBytes;
+        stat.ns += elapsedNs;
+        ++s_g313Seg.calls;
+        s_g313Seg.writerNs += elapsedNs;
+        ++stat.shapeCalls[g313Shape];
+        stat.shapeBytes[g313Shape] += sizeBytes;
+        stat.shapeNs[g313Shape] += elapsedNs;
+
+        ++s_g313Calls;
+        if ((s_g313Calls % 4096u) == 0u)
+        {
+            std::fprintf(stderr, "[G313:census] calls=%llu (writer-only; DC2_PERF must be off)\n",
+                         static_cast<unsigned long long>(s_g313Calls));
+            for (uint32_t psm = 0u; psm < 64u; ++psm)
+            {
+                const G313ImagePsmStat &p = s_g313Psm[psm];
+                if (p.calls == 0u)
+                    continue;
+                const double totalMs = static_cast<double>(p.ns) / 1000000.0;
+                const double mib = static_cast<double>(p.bytes) / (1024.0 * 1024.0);
+                const double mibPerSec = (p.ns != 0u) ? (mib * 1000000000.0 / p.ns) : 0.0;
+                std::fprintf(stderr,
+                             "[G313:psm] psm=0x%02x calls=%llu bytes=%llu ms=%.3f MiBps=%.2f "
+                             "mid=%llu/%.3f row=%llu/%.3f full=%llu/%.3f block=%llu/%.3f\n",
+                             psm,
+                             static_cast<unsigned long long>(p.calls),
+                             static_cast<unsigned long long>(p.bytes),
+                             totalMs,
+                             mibPerSec,
+                             static_cast<unsigned long long>(p.shapeCalls[0]),
+                             static_cast<double>(p.shapeNs[0]) / 1000000.0,
+                             static_cast<unsigned long long>(p.shapeCalls[1]),
+                             static_cast<double>(p.shapeNs[1]) / 1000000.0,
+                             static_cast<unsigned long long>(p.shapeCalls[2]),
+                             static_cast<double>(p.shapeNs[2]) / 1000000.0,
+                             static_cast<unsigned long long>(p.shapeCalls[3]),
+                             static_cast<double>(p.shapeNs[3]) / 1000000.0);
+            }
+        }
+    }
+
+    // G289 commits its exact partial-owner overwrite only after the complete IMAGE transfer
+    // has landed. Chunked IMAGE packets keep the owner conservative until the last chunk.
+    if (s_g313Census)
+        g313StepT0 = std::chrono::steady_clock::now();
+    const bool imageComplete = m_hwregY >= rrh;
+    static const bool s_g327Census = envFlagEnabled("DC2_G327_CENSUS");
+    if (s_g327Census)
+        g327NoteImageChunk(dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                           sizeBytes, imageComplete);
+    if (imageComplete)
+    {
+        g289NoteUploadComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        g314NoteImageComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        // G630: the guest IMAGE is now complete. Queue its exact CT32 pixels behind the producer
+        // in the raw-VRAM FIFO; no CPU publication or shared-queue wait is needed.
+        extern void (*g_g630UploadCompleteHook)(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, uint32_t, uint32_t);
+        if (g_g630UploadCompleteHook != nullptr)
+            g_g630UploadCompleteHook(m_vram, dbp, dbw, dpsm,
+                                     dsax, dsay, rrw, rrh);
+    }
+    if (s_g313Census)
+    {
+        s_g313Seg.commitNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        if ((s_g313Calls % 4096u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G313:seg] calls=%llu range=%.3f gen=%.3f bump=%.3f pre=%.3f writer=%.3f commit=%.3f ms\n",
+                         static_cast<unsigned long long>(s_g313Seg.calls),
+                         static_cast<double>(s_g313Seg.rangeNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.genNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.bumpNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.prewriterNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.writerNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.commitNs) / 1000000.0);
+        }
+    }
+
+    if (t8UploadTraceEnabled() &&
+        dpsm == GS_PSM_CT32 &&
+        (dbp == 0x2720u || dbp == 0x3220u) &&
+        dbw != 0u &&
+        rrw != 0u &&
+        rrh != 0u &&
+        sizeBytes != 0u &&
+        f51T8AliasShouldLog())
+    {
+        const uint32_t t8Tbw = static_cast<uint32_t>(dbw) * 2u;
+        const uint32_t sampleW = std::min<uint32_t>(rrw * 2u, 256u);
+        const uint32_t sampleH = std::min<uint32_t>(rrh * 2u, 256u);
+        uint32_t nzT8 = 0u;
+        uint32_t firstOff = 0u;
+        uint32_t firstX = 0u;
+        uint32_t firstY = 0u;
+        uint8_t firstByte = 0u;
+        bool haveFirst = false;
+
+        for (uint32_t y = 0u; y < sampleH; ++y)
+        {
+            for (uint32_t x = 0u; x < sampleW; ++x)
+            {
+                const uint32_t off = GSPSMT8::addrPSMT8(dbp, t8Tbw, dsax * 2u + x, dsay * 2u + y);
+                if (off < m_vramSize && m_vram[off] != 0u)
+                {
+                    ++nzT8;
+                    if (!haveFirst)
+                    {
+                        firstOff = off;
+                        firstX = x;
+                        firstY = y;
+                        firstByte = m_vram[off];
+                        haveFirst = true;
+                    }
+                }
+            }
+        }
+
+        std::fprintf(stderr,
+                     "[F51:t8alias] dbp=0x%x ct32dbw=%u t8tbw=%u dpsm=0x%x rr=(%u,%u) ds=(%u,%u) bytes=%u srcNz=%u t8Sample=%ux%u nzT8=%u first=(%u,%u off=0x%x byte=0x%02x)\n",
+                     dbp, static_cast<uint32_t>(dbw), t8Tbw, static_cast<uint32_t>(dpsm),
+                     rrw, rrh, dsax, dsay, sizeBytes, nonzeroBytes, sampleW, sampleH,
+                     nzT8, firstX, firstY, firstOff, firstByte);
+    }
+
+    // G3: raw VRAM page-region snapshot immediately after this upload completes.
+    // Pairs with the at-sample snapshot in the rasterizer to detect a later overwrite
+    // of the font page (0x2720 == RTT fbp=0x139). DC2_DUMP_VRAMRGN=1.
+    {
+        static const bool s_dumpRgn = []() {
+            const char *e = std::getenv("DC2_DUMP_VRAMRGN");
+            return e && e[0] != '0';
+        }();
+        if (s_dumpRgn && (dbp == 0x2720u || dbp == 0x2f20u || dbp == 0x3220u) && sizeBytes != 0u)
+        {
+            static std::atomic<int> s_rc2720{0}, s_rc2f20{0}, s_rc3220{0};
+            std::atomic<int> *rc = (dbp == 0x2720u) ? &s_rc2720 : (dbp == 0x2f20u) ? &s_rc2f20 : &s_rc3220;
+            const int idx = rc->fetch_add(1, std::memory_order_relaxed);
+            if (idx < 6)
+            {
+                const uint32_t rbase = dbp * 256u;
+                const uint32_t rlen = 0x40000u;
+                if (rbase + rlen <= m_vramSize)
+                {
+                    char p[128];
+                    std::snprintf(p, sizeof(p), "captures/vram_postup_%x_%d.bin", dbp, idx);
+                    FILE *fp = std::fopen(p, "wb");
+                    if (fp) { std::fwrite(m_vram + rbase, 1, rlen, fp); std::fclose(fp); }
+                    std::fprintf(stderr, "[G3:postup] %s rr=(%u,%u)\n", p, rrw, rrh);
+                }
+            }
+        }
+    }
+
+    // F50.10: immediately read VRAM back through the SAME addressing the sampler uses,
+    // to prove whether the write landed (independent of any later overwrite/timing).
+    if (renderQualityTraceEnabled() && rrw != 0u && rrh != 0u)
+    {
+        const bool isPT4 = (dpsm == GS_PSM_T4);
+        const bool isCT32clut = (dpsm == GS_PSM_CT32 && dbw == 1u);
+        if (isPT4 || isCT32clut)
+        {
+            static std::atomic<int> s_f510rb{0};
+            const int rb = s_f510rb.fetch_add(1, std::memory_order_relaxed);
+            if (rb < 40)
+            {
+                const uint32_t sampW = std::min<uint32_t>(rrw, 64u);
+                const uint32_t sampH = std::min<uint32_t>(rrh, 64u);
+                uint32_t nzBack = 0u;
+                if (isPT4)
+                {
+                    for (uint32_t y = 0; y < sampH; ++y)
+                        for (uint32_t x = 0; x < sampW; ++x)
+                        {
+                            const uint32_t na = GSPSMT4::addrPSMT4(dbp, (dbw != 0 ? dbw : 1u), dsax + x, dsay + y);
+                            const uint32_t bo = na >> 1;
+                            if (bo < m_vramSize && m_vram[bo] != 0u) ++nzBack;
+                        }
+                }
+                else
+                {
+                    for (uint32_t y = 0; y < sampH; ++y)
+                        for (uint32_t x = 0; x < sampW; ++x)
+                        {
+                            const uint32_t off = GSPSMCT32::addrPSMCT32(dbp, dbw, dsax + x, dsay + y);
+                            if (off + 4u <= m_vramSize)
+                            {
+                                uint32_t w; std::memcpy(&w, m_vram + off, 4);
+                                if (w != 0u) ++nzBack;
+                            }
+                        }
+                }
+                std::fprintf(stderr,
+                             "[F510:readback] rb=%d dpsm=0x%x dbp=0x%x dbw=%u ds=(%u,%u) rr=(%u,%u) sampled=%ux%u nzInVram=%u\n",
+                             rb, (unsigned)dpsm, dbp, (unsigned)dbw, dsax, dsay, rrw, rrh, sampW, sampH, nzBack);
+            }
+        }
+    }
+}
+
+void GS::performLocalToHostToBuffer()
+{
+    m_localToHostBuffer.clear();
+    m_localToHostReadPos = 0;
+    if (!m_vram)
+        return;
+
+    uint32_t sbp = m_bitbltbuf.sbp;
+    uint8_t sbw = m_bitbltbuf.sbw;
+    uint8_t spsm = m_bitbltbuf.spsm;
+
+    if (sbw == 0)
+        sbw = 1;
+    uint32_t base = sbp * 256u;
+    uint32_t bpp = bitsPerPixel(spsm);
+    uint32_t stridePixels = static_cast<uint32_t>(sbw) * 64u;
+
+    uint32_t rrw = m_trxreg.rrw;
+    uint32_t rrh = m_trxreg.rrh;
+    uint32_t ssax = m_trxpos.ssax;
+    uint32_t ssay = m_trxpos.ssay;
+
+    // G356/G359: for the Sindain-menu grab (CT32, 512-wide) dump BOTH display blocks (0x0 and 0xd00)
+    // straight from VRAM. G359: fire once per PARITY — the readback reads block 0x0 (parity A, clean)
+    // OR block 0xd00 (parity B, garbage) depending on frame timing. Dump both blocks at BOTH parities
+    // so we can see whether block 0xd00 is stale/garbage in VRAM at the parity-B (garbage) capture.
+    static const bool s_g356Blk = (std::getenv("DC2_G356_STORE") != nullptr);
+    if (s_g356Blk && (spsm == GS_PSM_CT32) && rrw >= 256u && rrh >= 256u &&
+        (sbp == 0u || sbp == 0x6800u))
+    {
+        const char parity = (sbp == 0u) ? 'A' : 'B';
+        static std::atomic<uint32_t> s_dumpedA{0}, s_dumpedB{0};
+        auto &guard = (sbp == 0u) ? s_dumpedA : s_dumpedB;
+        if (guard.fetch_add(1u, std::memory_order_relaxed) == 0u)
+        {
+            for (uint32_t blk : {0u, 0xd00u})
+            {
+                char path[64];
+                std::snprintf(path, sizeof(path), "captures/g359_p%c_blk%x.ppm", parity, blk);
+                FILE *fp = std::fopen(path, "wb");
+                if (!fp) continue;
+                std::fprintf(fp, "P6\n%u %u\n255\n", rrw, rrh);
+                for (uint32_t y = 0; y < rrh; ++y)
+                    for (uint32_t x = 0; x < rrw; ++x)
+                    {
+                        const uint32_t o = GSPSMCT32::addrPSMCT32(blk, sbw, ssax + x, ssay + y);
+                        uint8_t rgb[3] = {0,0,0};
+                        if (o + 3u < m_vramSize) { rgb[0]=m_vram[o]; rgb[1]=m_vram[o+1]; rgb[2]=m_vram[o+2]; }
+                        std::fwrite(rgb, 1, 3, fp);
+                    }
+                std::fclose(fp);
+                std::fprintf(stderr, "[G359:blk] parity=%c readsSbp=0x%x dumped %s\n", parity, sbp, path);
+            }
+        }
+    }
+
+    // G242: establish GS submission order first, then publish any persistent depth aliased by the
+    // source.  Keep the historical default-off path byte-for-byte unchanged.
+    if (g242GuestDepthEnabled())
+        g144FlushPendingUpload();
+    {
+        // G432: the barrier is a blocking GPU->VRAM materialisation; time it apart from the gather.
+        const uint64_t g432Px = static_cast<uint64_t>(rrw) * rrh;
+        if (g432CensusOn())
+        {
+            G432Scope sc(&s_g432Prep, g432Px);
+            g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+        }
+        else
+        {
+            g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+        }
+    }
+
+    // G432: charge the whole per-pixel gather below to the PSM-class bucket. Scope ends at the
+    // close of the function body's gather region (see the matching brace before the G358 dump).
+    const bool g432Armed = g432CensusOn();
+    G432Scope g432Gather(g432Armed ? &s_g432Gather[g432PsmClass(spsm)] : nullptr,
+                         static_cast<uint64_t>(rrw) * rrh);
+
+    if (bpp == 4)
+    {
+        uint32_t rowBytes = (rrw + 1u) / 2u;
+        if (rowBytes == 0)
+            rowBytes = 1;
+        m_localToHostBuffer.reserve(rowBytes * rrh);
+        uint32_t widthBlocks = static_cast<uint32_t>(sbw);
+        for (uint32_t y = 0; y < rrh; ++y)
+        {
+            for (uint32_t x = 0; x < rrw; ++x)
+            {
+                uint32_t vx = ssax + x;
+                uint32_t vy = ssay + y;
+                uint32_t nibbleAddr = GSPSMT4::addrPSMT4(sbp, widthBlocks, vx, vy);
+                uint32_t byteOff = nibbleAddr >> 1;
+                uint8_t nibble = 0;
+                if (byteOff < m_vramSize)
+                {
+                    int shift = static_cast<int>((nibbleAddr & 1u) << 2);
+                    nibble = static_cast<uint8_t>((m_vram[byteOff] >> shift) & 0x0Fu);
+                }
+                if (x & 1u)
+                    m_localToHostBuffer.back() = static_cast<uint8_t>((m_localToHostBuffer.back() & 0x0Fu) | (nibble << 4));
+                else
+                    m_localToHostBuffer.push_back(nibble);
+            }
+        }
+    }
+    else if (spsm == GS_PSM_T8)
+    {
+        m_localToHostBuffer.reserve(rrw * rrh);
+        for (uint32_t y = 0; y < rrh; ++y)
+        {
+            for (uint32_t x = 0; x < rrw; ++x)
+            {
+                const uint32_t src = GSPSMT8::addrPSMT8(sbp, sbw, ssax + x, ssay + y);
+                m_localToHostBuffer.push_back((src < m_vramSize) ? m_vram[src] : 0u);
+            }
+        }
+    }
+    else if (spsm == GS_PSM_CT24 || spsm == GS_PSM_Z24)
+    {
+        uint32_t transferBpp = 3;
+        m_localToHostBuffer.reserve(rrw * rrh * transferBpp);
+
+        for (uint32_t y = 0; y < rrh; ++y)
+        {
+            for (uint32_t x = 0; x < rrw; ++x)
+            {
+                uint32_t srcOff = GSPSMCT32::addrPSMCT32(sbp, sbw, ssax + x, ssay + y);
+                if (srcOff + 4 <= m_vramSize)
+                {
+                    m_localToHostBuffer.push_back(m_vram[srcOff + 0]);
+                    m_localToHostBuffer.push_back(m_vram[srcOff + 1]);
+                    m_localToHostBuffer.push_back(m_vram[srcOff + 2]);
+                }
+            }
+        }
+    }
+    else
+    {
+        uint32_t bytesPerPixel = bpp / 8u;
+        if (bytesPerPixel == 0)
+            bytesPerPixel = 4;
+        uint32_t strideBytes = stridePixels * bytesPerPixel;
+        uint32_t rowBytes = rrw * bytesPerPixel;
+        m_localToHostBuffer.reserve(rowBytes * rrh);
+
+        for (uint32_t y = 0; y < rrh; ++y)
+        {
+            if (spsm == GS_PSM_CT32 || spsm == GS_PSM_Z32)
+            {
+                for (uint32_t x = 0; x < rrw; ++x)
+                {
+                    const uint32_t srcOff = GSPSMCT32::addrPSMCT32(sbp, sbw, ssax + x, ssay + y);
+                    if (srcOff + 4u <= m_vramSize)
+                    {
+                        m_localToHostBuffer.push_back(m_vram[srcOff + 0u]);
+                        m_localToHostBuffer.push_back(m_vram[srcOff + 1u]);
+                        m_localToHostBuffer.push_back(m_vram[srcOff + 2u]);
+                        m_localToHostBuffer.push_back(m_vram[srcOff + 3u]);
+                    }
+                }
+            }
+            else
+            {
+                uint32_t srcOff = base + (ssay + y) * strideBytes + ssax * bytesPerPixel;
+                if (srcOff + rowBytes <= m_vramSize)
+                {
+                    for (uint32_t i = 0; i < rowBytes; ++i)
+                        m_localToHostBuffer.push_back(m_vram[srcOff + i]);
+                }
+            }
+        }
+    }
+    // G358: census every local->host fill (which one feeds the Sindain grab's consume?) + dump the
+    // CT32 fill result buffer for the store-shaped transfer. Behavior-pure (read-only diag).
+    if (std::getenv("DC2_G358_BUF") != nullptr)
+    {
+        static std::atomic<uint32_t> s_call{0};
+        const uint32_t c = s_call.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        std::fprintf(stderr, "[G358:l2h] call=%u sbp=0x%x sbw=%u spsm=0x%x rrw=%u rrh=%u ssa=(%u,%u) bufBytes=%zu\n",
+                     c, sbp, sbw, spsm, rrw, rrh, ssax, ssay, m_localToHostBuffer.size());
+        if (spsm == GS_PSM_CT32 && rrw >= 256u && rrh >= 256u && c <= 8u)
+        {
+            char path[64];
+            std::snprintf(path, sizeof(path), "captures/g358_l2h_c%u.ppm", c);
+            FILE *fp = std::fopen(path, "wb");
+            if (fp)
+            {
+                std::fprintf(fp, "P6\n%u %u\n255\n", rrw, rrh);
+                const size_t n = m_localToHostBuffer.size();
+                for (uint32_t y = 0; y < rrh; ++y)
+                    for (uint32_t x = 0; x < rrw; ++x)
+                    {
+                        const size_t i = (static_cast<size_t>(y) * rrw + x) * 4u;
+                        uint8_t rgb[3] = {0,0,0};
+                        if (i + 2u < n) { rgb[0]=m_localToHostBuffer[i]; rgb[1]=m_localToHostBuffer[i+1]; rgb[2]=m_localToHostBuffer[i+2]; }
+                        std::fwrite(rgb, 1, 3, fp);
+                    }
+                std::fclose(fp);
+                std::fprintf(stderr, "[G358:l2h] dumped %s\n", path);
+            }
+        }
+    }
+}
+
+bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+{
+    G508StateLock lock(m_stateMutex);
+    return clearFramebufferRect(m_vram, m_vramSize, m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+}
+
+bool GS::clearActiveFramebuffer(uint32_t rgba)
+{
+    G508StateLock lock(m_stateMutex);
+    return clearFramebufferRect(m_vram, m_vramSize, activeContext(), rgba);
+}
+
+uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+{
+    G508StateLock lock(m_stateMutex);
+    if (!dst || maxBytes == 0)
+        return 0;
+    size_t avail = m_localToHostBuffer.size() - m_localToHostReadPos;
+    if (std::getenv("DC2_G358_BUF") != nullptr)
+    {
+        static std::atomic<uint32_t> s_c{0};
+        std::fprintf(stderr, "[G358:consume] n=%u bufSize=%zu readPos=%zu avail=%zu maxBytes=%u\n",
+                     s_c.fetch_add(1u, std::memory_order_relaxed) + 1u,
+                     m_localToHostBuffer.size(), m_localToHostReadPos, avail, maxBytes);
+    }
+    if (avail == 0)
+        return 0;
+    size_t toCopy = (avail < maxBytes) ? avail : static_cast<size_t>(maxBytes);
+    std::memcpy(dst, m_localToHostBuffer.data() + m_localToHostReadPos, toCopy);
+    m_localToHostReadPos += toCopy;
+    return static_cast<uint32_t>(toCopy);
+}

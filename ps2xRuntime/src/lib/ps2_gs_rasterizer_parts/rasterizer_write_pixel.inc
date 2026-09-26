@@ -1,0 +1,1812 @@
+namespace
+{
+#if defined(PS2X_G658_DIAG)
+// G658 P2-P4/P9: CPU half of the mode-6 stage oracle. The GPU backend has an independent cached
+// reader of the same process-constant selector. 0=normal, 1=source-only, 2=constant-source
+// coverage, 3=constant-source through the normal mode-6 blend, 4=strict CPU coverage with the
+// normal source/blend, 5=exact sampler/combine plus CPU-style truncated vertex shade on GPU,
+// 6=CPU-style truncated vertex shade with the existing GL bilinear sampler, 7=mode-6 ordered
+// integer image-load/store blend prototype.
+// Diagnostic build only.
+static int g658Mode6StageCpu()
+{
+    static const int stage = []() {
+        const char *value = std::getenv("DC2_G658_STAGE");
+        const int parsed = value ? std::atoi(value) : 0;
+        return parsed >= 0 && parsed <= 7 ? parsed : 0;
+    }();
+    return stage;
+}
+
+static bool g658Mode6CpuActive(bool abe, const GSContext &ctx)
+{
+    if (g658Mode6StageCpu() == 0 || !abe)
+        return false;
+    const uint64_t alpha = ctx.alpha;
+    return (ctx.frame.fbp == 0u || ctx.frame.fbp == 0x68u) &&
+           (alpha & 3u) == 2u && ((alpha >> 2u) & 3u) == 0u &&
+           ((alpha >> 4u) & 3u) == 0u && ((alpha >> 6u) & 3u) == 1u;
+}
+#else
+static constexpr int g658Mode6StageCpu() { return 0; }
+static constexpr bool g658Mode6CpuActive(bool, const GSContext &) { return false; }
+#endif
+
+constexpr int kG407ScanX0 = 130;
+constexpr int kG407ScanX1 = 224;
+constexpr int kG407ScanY0 = 260;
+constexpr int kG407ScanY1 = 344;
+constexpr int kG407ScanW = kG407ScanX1 - kG407ScanX0 + 1;
+constexpr int kG407ScanH = kG407ScanY1 - kG407ScanY0 + 1;
+constexpr int kG407ScanPixels = kG407ScanW * kG407ScanH;
+constexpr int kG407ScanSlots = kG407ScanPixels * 2;
+constexpr int kG407ScanStages = 6;
+constexpr int kG407ScanSequence = 16;
+
+struct G407AutoScanState
+{
+    std::array<std::atomic<uint64_t>, kG407ScanSlots> final{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanStages> stageFinal{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanStages> stageSource{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots> sequenceCount{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanSequence> sequenceFinal{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanSequence> sequenceSource{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanSequence> sequenceMeta{};
+    std::atomic<uint64_t> seenTick{0};
+    std::atomic<bool> dumped{false};
+};
+
+G407AutoScanState &g407AutoScanState()
+{
+    static G407AutoScanState state;
+    return state;
+}
+
+uint64_t g407PackTickPixel(uint64_t tick, uint32_t pixel)
+{
+    return ((tick & 0xFFFFFFFFull) << 32u) | static_cast<uint64_t>(pixel);
+}
+
+bool g407UnpackTickPixel(uint64_t packed, uint64_t tick, uint32_t &pixel)
+{
+    if ((packed >> 32u) != (tick & 0xFFFFFFFFull))
+        return false;
+    pixel = static_cast<uint32_t>(packed);
+    return true;
+}
+
+void g407AutoScanPrevious(uint64_t tick)
+{
+    G407AutoScanState &s = g407AutoScanState();
+    if (tick == 0u || s.dumped.load(std::memory_order_relaxed))
+        return;
+
+    struct Candidate
+    {
+        int score;
+        int slot;
+        int x;
+        int y;
+        int fb;
+        uint32_t pixel;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(64);
+
+    for (int fb = 0; fb < 2; ++fb)
+    {
+        bool mapCompositeSeen = false;
+        for (int i = 0; i < kG407ScanPixels; ++i)
+        {
+            uint32_t ignored = 0u;
+            const int stageSlot = (fb * kG407ScanPixels + i) * kG407ScanStages + 1;
+            if (g407UnpackTickPixel(
+                    s.stageFinal[stageSlot].load(std::memory_order_relaxed), tick, ignored))
+            {
+                mapCompositeSeen = true;
+                break;
+            }
+        }
+        if (!mapCompositeSeen)
+            continue;
+
+        for (int y = kG407ScanY0 + 2; y <= kG407ScanY1 - 2; ++y)
+        {
+            for (int x = kG407ScanX0 + 2; x <= 220; ++x)
+            {
+                const int local = (y - kG407ScanY0) * kG407ScanW + (x - kG407ScanX0);
+                const int slot = fb * kG407ScanPixels + local;
+                uint32_t pixel = 0u;
+                if (!g407UnpackTickPixel(
+                        s.final[slot].load(std::memory_order_relaxed), tick, pixel))
+                    continue;
+
+                std::array<int, 8> ng{}, nb{};
+                int n = 0;
+                for (const auto [dx, dy] :
+                     {std::pair<int, int>{-2, -2}, {-2, 0}, {-2, 2}, {0, -2},
+                      {0, 2}, {2, -2}, {2, 0}, {2, 2}})
+                {
+                    const int ni = (y + dy - kG407ScanY0) * kG407ScanW +
+                                   (x + dx - kG407ScanX0);
+                    uint32_t neighbor = 0u;
+                    if (!g407UnpackTickPixel(
+                            s.final[fb * kG407ScanPixels + ni].load(std::memory_order_relaxed),
+                            tick, neighbor))
+                    {
+                        n = 0;
+                        break;
+                    }
+                    ng[n] = static_cast<int>((neighbor >> 8u) & 0xFFu);
+                    nb[n] = static_cast<int>((neighbor >> 16u) & 0xFFu);
+                    ++n;
+                }
+                if (n != 8)
+                    continue;
+                std::sort(ng.begin(), ng.end());
+                std::sort(nb.begin(), nb.end());
+                const int medianG = (ng[3] + ng[4]) / 2;
+                const int medianB = (nb[3] + nb[4]) / 2;
+                const int g = static_cast<int>((pixel >> 8u) & 0xFFu);
+                const int b = static_cast<int>((pixel >> 16u) & 0xFFu);
+                const int score = (medianG - g) + (medianB - b);
+                if (medianG >= 160 && medianB >= 160 && g >= 100 && b >= 100 && score >= 30)
+                    candidates.push_back(Candidate{score, slot, x, y, fb, pixel});
+            }
+        }
+    }
+
+    if (candidates.size() < 5u)
+        return;
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &a, const Candidate &b) { return a.score > b.score; });
+    if (s.dumped.exchange(true, std::memory_order_relaxed))
+        return;
+
+    const size_t count = std::min<size_t>(candidates.size(), 20u);
+    std::fprintf(stderr, "[G407:autoscan] tick=%llu candidates=%zu showing=%zu\n",
+                 static_cast<unsigned long long>(tick), candidates.size(), count);
+    for (size_t ci = 0; ci < count; ++ci)
+    {
+        const Candidate &c = candidates[ci];
+        std::fprintf(stderr,
+                     "[G407:dot] rank=%zu score=%d fbp=%s xy=(%d,%d) final=%08x\n",
+                     ci + 1u, c.score, c.fb ? "0x68" : "0x0", c.x, c.y, c.pixel);
+        const int local = c.slot - c.fb * kG407ScanPixels;
+        for (int stage = 0; stage < kG407ScanStages; ++stage)
+        {
+            const int si = (c.fb * kG407ScanPixels + local) * kG407ScanStages + stage;
+            uint32_t after = 0u, source = 0u;
+            if (g407UnpackTickPixel(
+                    s.stageFinal[si].load(std::memory_order_relaxed), tick, after))
+            {
+                (void)g407UnpackTickPixel(
+                    s.stageSource[si].load(std::memory_order_relaxed), tick, source);
+                std::fprintf(stderr,
+                             "[G407:stage] xy=(%d,%d) stage=%d src=%08x after=%08x\n",
+                             c.x, c.y, stage, source, after);
+            }
+        }
+        const uint64_t sequenceState =
+            s.sequenceCount[c.slot].load(std::memory_order_relaxed);
+        if ((sequenceState >> 32u) == (tick & 0xFFFFFFFFull))
+        {
+            const uint32_t sequenceCount =
+                std::min<uint32_t>(static_cast<uint32_t>(sequenceState),
+                                   kG407ScanSequence);
+            for (uint32_t seq = 0; seq < sequenceCount; ++seq)
+            {
+                const int qi = c.slot * kG407ScanSequence + static_cast<int>(seq);
+                uint32_t after = 0u, source = 0u, meta = 0u;
+                if (!g407UnpackTickPixel(
+                        s.sequenceFinal[qi].load(std::memory_order_relaxed), tick, after))
+                    continue;
+                (void)g407UnpackTickPixel(
+                    s.sequenceSource[qi].load(std::memory_order_relaxed), tick, source);
+                (void)g407UnpackTickPixel(
+                    s.sequenceMeta[qi].load(std::memory_order_relaxed), tick, meta);
+                std::fprintf(stderr,
+                             "[G407:sequence] xy=(%d,%d) n=%u prim=%u tme=%u abe=%u fst=%u "
+                             "tbp=0x%x src=%08x after=%08x\n",
+                             c.x, c.y, seq,
+                             (meta >> 16u) & 0x7u,
+                             (meta >> 19u) & 0x1u,
+                             (meta >> 20u) & 0x1u,
+                             (meta >> 21u) & 0x1u,
+                             meta & 0x3FFFu, source, after);
+            }
+        }
+    }
+}
+
+// G530: the SAME cached flag g407AutoRecord() tests first. Exposed so the per-pixel commit can
+// short-circuit BEFORE it pays for the extra `before` VRAM read and the call itself. G407's
+// auto-scan is a default-off diagnostic, so on the shipped path this deletes one dependent 4-byte
+// load and one non-inlined call from EVERY framebuffer commit in the rasterizer (sprites, triangles
+// and lines alike) with no behavioural surface at all: when the flag IS set the guarded block is
+// entered and runs exactly as before.
+// G626: this predicate is read TWICE per committed pixel (here and at the commit short-circuit
+// below), and a function-local `static const bool` is an `_Init_global_epoch` TLS read plus a
+// compare on EVERY access under MSVC — the defect G619 measured at 20.7% of the EE thread, one
+// level down. Cached at namespace scope with the rest of the per-pixel predicate set; the
+// historical per-call read is the control arm `DC2_G626_LIVE_PIXFLAG=1`.
+static const bool g_g626G407AutoScan = g626EnvOnce("DC2_G407_AUTOSCAN");
+
+bool g407AutoScanEnabled()
+{
+    G626_LEGACY_FLAG("DC2_G407_AUTOSCAN");
+    return g_g626G407AutoScan;
+}
+
+void g407AutoRecord(const GSContext &ctx,
+                    uint32_t primType,
+                    bool primTme,
+                    bool primAbe,
+                    bool primFst,
+                    int x,
+                    int y,
+                    uint32_t before,
+                    uint32_t pixel,
+                    uint8_t srcR,
+                    uint8_t srcG,
+                    uint8_t srcB,
+                    uint8_t srcA)
+{
+    const bool enabled = g407AutoScanEnabled();
+    if (!enabled ||
+        x < kG407ScanX0 || x > kG407ScanX1 ||
+        y < kG407ScanY0 || y > kG407ScanY1 ||
+        (ctx.frame.fbp != 0x0u && ctx.frame.fbp != 0x68u) ||
+        (before & 0x00FFFFFFu) == (pixel & 0x00FFFFFFu))
+        return;
+
+    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    G407AutoScanState &s = g407AutoScanState();
+    uint64_t seen = s.seenTick.load(std::memory_order_relaxed);
+    if (seen != tick &&
+        s.seenTick.compare_exchange_strong(seen, tick, std::memory_order_relaxed))
+    {
+        g407AutoScanPrevious(seen);
+    }
+
+    const int fb = ctx.frame.fbp == 0x68u ? 1 : 0;
+    const int local = (y - kG407ScanY0) * kG407ScanW + (x - kG407ScanX0);
+    const int slot = fb * kG407ScanPixels + local;
+    const uint64_t finalPacked = g407PackTickPixel(tick, pixel);
+    s.final[slot].store(finalPacked, std::memory_order_relaxed);
+
+    uint64_t sequenceState = s.sequenceCount[slot].load(std::memory_order_relaxed);
+    uint32_t sequenceCount = 0u;
+    if ((sequenceState >> 32u) == (tick & 0xFFFFFFFFull))
+        sequenceCount = static_cast<uint32_t>(sequenceState);
+    if (sequenceCount < kG407ScanSequence)
+    {
+        const int qi = slot * kG407ScanSequence + static_cast<int>(sequenceCount);
+        const uint32_t source = static_cast<uint32_t>(srcR) |
+                                (static_cast<uint32_t>(srcG) << 8u) |
+                                (static_cast<uint32_t>(srcB) << 16u) |
+                                (static_cast<uint32_t>(srcA) << 24u);
+        const uint32_t meta = (ctx.tex0.tbp0 & 0x3FFFu) |
+                              ((primType & 0x7u) << 16u) |
+                              (static_cast<uint32_t>(primTme) << 19u) |
+                              (static_cast<uint32_t>(primAbe) << 20u) |
+                              (static_cast<uint32_t>(primFst) << 21u);
+        s.sequenceFinal[qi].store(finalPacked, std::memory_order_relaxed);
+        s.sequenceSource[qi].store(
+            g407PackTickPixel(tick, source), std::memory_order_relaxed);
+        s.sequenceMeta[qi].store(
+            g407PackTickPixel(tick, meta), std::memory_order_relaxed);
+    }
+    s.sequenceCount[slot].store(
+        ((tick & 0xFFFFFFFFull) << 32u) |
+            static_cast<uint64_t>(sequenceCount + 1u),
+        std::memory_order_relaxed);
+
+    int stage = 5;
+    if (!primTme && srcR == 0x04u && srcG == 0x46u &&
+        srcB == 0x1eu && srcA == 0x80u)
+        stage = 0;
+    else if (primTme && ctx.tex0.tbp0 == 0x2f20u)
+        stage = 1;
+    else if (primTme && ctx.tex0.tbp0 == 0x28e0u)
+        stage = 2;
+    else if (primTme && ctx.tex0.tbp0 == 0x2720u)
+        stage = 3;
+    else if (!primTme && srcR == 0u && srcG == 0u && srcB == 0u)
+        stage = 4;
+
+    const int si = slot * kG407ScanStages + stage;
+    const uint32_t source = static_cast<uint32_t>(srcR) |
+                            (static_cast<uint32_t>(srcG) << 8u) |
+                            (static_cast<uint32_t>(srcB) << 16u) |
+                            (static_cast<uint32_t>(srcA) << 24u);
+    s.stageFinal[si].store(finalPacked, std::memory_order_relaxed);
+    s.stageSource[si].store(g407PackTickPixel(tick, source), std::memory_order_relaxed);
+}
+} // namespace
+
+void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    const auto &ctx = gs->activeContext();
+    // PHASE F30: writePixel entry counter, retained only for explicit phase tracing.
+    if (phaseDiagnosticsEnabled())
+    {
+        static std::atomic<uint64_t> s_f30PxEntry{0};
+        const uint64_t n = s_f30PxEntry.fetch_add(1, std::memory_order_relaxed) + 1ull;
+        if (n <= 8ull || (n & 0xFFFFull) == 0ull)
+        {
+            std::fprintf(stderr,
+                         "[F30:px.enter] n=%llu x=%d y=%d fbp=0x%x fbw=%u psm=%u sciss=[%d,%d,%d,%d]\n",
+                         static_cast<unsigned long long>(n), x, y,
+                         ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm,
+                         ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1);
+        }
+    }
+    if (x < ctx.scissor.x0 || x > ctx.scissor.x1 ||
+        y < ctx.scissor.y0 || y > ctx.scissor.y1)
+    {
+        if (phaseDiagnosticsEnabled())
+        {
+        static std::atomic<uint64_t> s_f30Sciss{0};
+        const uint64_t n = s_f30Sciss.fetch_add(1, std::memory_order_relaxed) + 1ull;
+        if (n <= 4ull || (n & 0x3FFFull) == 0ull)
+        {
+            std::fprintf(stderr,
+                         "[F30:px.scissCull] n=%llu x=%d y=%d sciss=[%d,%d,%d,%d]\n",
+                             static_cast<unsigned long long>(n), x, y,
+                             ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1);
+        }
+        }
+        return;
+    }
+
+    // G365 (diagnostic, default-off): watch the far-right screen columns of the scene RTT
+    // (fbp=0x139 / tbp 0x2720) and of the display buffer (fbp=0x68). The MAP-160 right-edge
+    // colour line lives at x=509..510, rows ~61..386, and is frozen across frames, so this
+    // pins whether ANY rasterized draw writes those columns (vs a transfer/upload).
+    {
+        static const bool s_g365w = (std::getenv("DC2_G365_WATCH") != nullptr);
+        // Per-column coverage census: how many writes (and how many BLACK writes) each of the
+        // right-hand columns of the display buffer receives. A hole at x=509/510 means the
+        // final black cover has a 2-column gap; equal counts mean the gap is in the SOURCE.
+        static const int s_g365Col0 = []() -> int {
+            const char *e = std::getenv("DC2_G365_COL0");
+            return e ? std::atoi(e) : 500;
+        }();
+        if (s_g365w && x >= s_g365Col0 && x < s_g365Col0 + 12 &&
+            (ctx.frame.fbp == 0x68u || ctx.frame.fbp == 0x139u))
+        {
+            const int fi = (ctx.frame.fbp == 0x68u) ? 0 : 1;
+            static std::atomic<uint64_t> s_col[2][12] = {};
+            static std::atomic<uint64_t> s_colBlack[2][12] = {};
+            static std::atomic<uint64_t> s_tot{0};
+            const int idx = x - s_g365Col0;
+            s_col[fi][idx].fetch_add(1u, std::memory_order_relaxed);
+            if ((static_cast<uint32_t>(r) | g | b) == 0u)
+                s_colBlack[fi][idx].fetch_add(1u, std::memory_order_relaxed);
+            const uint64_t tn = s_tot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if ((tn % 200000ull) == 0ull)
+            {
+                for (int f = 0; f < 2; ++f)
+                {
+                    char buf[512]; int p = 0;
+                    p += std::snprintf(buf + p, sizeof(buf) - p, "[G365:cov] n=%llu fbp=%s",
+                                       (unsigned long long)tn, f ? "0x139" : "0x68");
+                    for (int i = 0; i < 12; ++i)
+                        p += std::snprintf(buf + p, sizeof(buf) - p, " x%d=%llu/%llu", s_g365Col0 + i,
+                                           (unsigned long long)s_colBlack[f][i].load(std::memory_order_relaxed),
+                                           (unsigned long long)s_col[f][i].load(std::memory_order_relaxed));
+                    std::fprintf(stderr, "%s (black/total)\n", buf);
+                }
+            }
+        }
+        // Ordered log of EVERY write to one watched display row, so the LAST writer of the
+        // right-edge columns can be identified (DC2_G365_ROW=1).
+        {
+            static const bool s_g365row = (std::getenv("DC2_G365_ROW") != nullptr);
+            if (s_g365row && ctx.frame.fbp == 0x68u && y == 200 && x >= 504 && x <= 511)
+            {
+                static std::atomic<uint32_t> s_rn{0};
+                const uint32_t rn = s_rn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (rn > 3000u && rn <= 3200u)
+                    std::fprintf(stderr,
+                        "[G365:row] n=%u x=%d prim=%u tme=%u tbp=0x%x tpsm=0x%x rgb=(%u,%u,%u) a=%u\n",
+                        rn, x, gs->m_prim.type, gs->m_prim.tme, ctx.tex0.tbp0,
+                        (unsigned)ctx.tex0.psm, r, g, b, a);
+            }
+        }
+        // Watch the two half-res source columns of the scene RTT that feed the right-edge line.
+        if (s_g365w && ctx.frame.fbp == 0x139u && (x == 254 || x == 255) &&
+            (y == 40 || y == 92 || y == 137))
+        {
+            static std::atomic<uint32_t> s_hn{0};
+            const uint32_t hn = s_hn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (hn <= 400u || (hn % 2000u) == 0u)
+                std::fprintf(stderr,
+                    "[G365:half] n=%u x=%d y=%d prim=%u tme=%u tbp=0x%x tpsm=0x%x tfx=%u "
+                    "rgb=(%u,%u,%u) a=%u abe=%u\n",
+                    hn, x, y, gs->m_prim.type, gs->m_prim.tme, ctx.tex0.tbp0,
+                    (unsigned)ctx.tex0.psm, (unsigned)ctx.tex0.tfx, r, g, b, a,
+                    (unsigned)gs->m_prim.abe);
+        }
+        if (s_g365w && x >= 508 && x <= 511 && ctx.frame.fbp == 0x68u &&
+            (static_cast<uint32_t>(r) | g | b) != 0u)
+        {
+            static std::atomic<uint32_t> s_g365n{0};
+            const uint32_t wn = s_g365n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (wn <= 300u || (wn % 2000u) == 0u)
+                std::fprintf(stderr,
+                    "[G365:px] n=%u fbp=0x%x x=%d y=%d prim=%u tme=%u fst=%u tbp=0x%x tpsm=0x%x "
+                    "tw=%u th=%u tbw=%u clamp=0x%llx rgb=(%u,%u,%u) "
+                    "v0=(%.1f,%.1f uv=%.1f,%.1f st=%.4f,%.4f q=%.3f) "
+                    "v1=(%.1f,%.1f uv=%.1f,%.1f st=%.4f,%.4f q=%.3f)\n",
+                    wn, ctx.frame.fbp, x, y, gs->m_prim.type, gs->m_prim.tme, gs->m_prim.fst,
+                    ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm),
+                    ctx.tex0.tw, ctx.tex0.th, ctx.tex0.tbw,
+                    static_cast<unsigned long long>(ctx.clamp), r, g, b,
+                    gs->m_vtxQueue[0].x, gs->m_vtxQueue[0].y,
+                    (double)gs->m_vtxQueue[0].u / 16.0, (double)gs->m_vtxQueue[0].v / 16.0,
+                    gs->m_vtxQueue[0].s, gs->m_vtxQueue[0].t, gs->m_vtxQueue[0].q,
+                    gs->m_vtxQueue[1].x, gs->m_vtxQueue[1].y,
+                    (double)gs->m_vtxQueue[1].u / 16.0, (double)gs->m_vtxQueue[1].v / 16.0,
+                    gs->m_vtxQueue[1].s, gs->m_vtxQueue[1].t, gs->m_vtxQueue[1].q);
+        }
+    }
+
+    // G356: watch the Sindain menu circle-centre pixel (screen ~340,200) of the display buffers.
+    // Logs every draw that writes it — prim/tex/incoming-colour/alpha — to identify the writer that
+    // degrades the circle from field to garbage after menu-open. Tightly gated (exact pixel), capped.
+    {
+        static const bool s_g356w = (std::getenv("DC2_G356_WATCH") != nullptr);
+        if (s_g356w && x == 340 && y == 200 &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u))
+        {
+            static std::atomic<uint32_t> s_wn{0};
+            const uint32_t wn = s_wn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (wn <= 400u)
+                std::fprintf(stderr,
+                    "[G356:watch] wn=%u fbp=0x%x fbw=%u fpsm=0x%x xyoff=(%d,%d) prim=%u tme=%u abe=%u tbp=0x%x psm=0x%x "
+                    "in_rgba=(%u,%u,%u,%u) alpha=0x%llx test=0x%llx\n",
+                    wn, ctx.frame.fbp, ctx.frame.fbw, static_cast<uint32_t>(ctx.frame.psm),
+                    ctx.xyoffset.ofx >> 4, ctx.xyoffset.ofy >> 4,
+                    gs->m_prim.type, gs->m_prim.tme, gs->m_prim.abe,
+                    ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm), r, g, b, a,
+                    static_cast<unsigned long long>(ctx.alpha),
+                    static_cast<unsigned long long>(ctx.test));
+            // Dump EACH distinct texture feeding the circle once — reveals which composite layer
+            // turns the field into blue/magenta noise. Deduped by tbp (small fixed table).
+            static std::atomic<uint32_t> s_dumpedTbp[8] = {};
+            static std::atomic<int> s_dumpCount{0};
+            bool dumpThis = false;
+            // G357: LATE dump — re-dump each circle source texture once the menu has frozen
+            // (wn>=300) via the SAME sampler decode, to see whether the frozen source is clean
+            // (=> geometry/projection bug) or garbage (=> texture upload/decode bug).
+            if (std::getenv("DC2_G357_LATETEX") != nullptr && wn >= 300u && wn <= 360u &&
+                gs->m_prim.tme && ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tw >= 6 && ctx.tex0.th >= 6)
+            {
+                static std::atomic<uint32_t> s_lateDumped[8] = {};
+                static std::atomic<int> s_lateN{0};
+                bool seen = false;
+                const int cap = s_lateN.load(std::memory_order_relaxed);
+                for (int i = 0; i < cap && i < 8; ++i)
+                    if (s_lateDumped[i].load(std::memory_order_relaxed) == ctx.tex0.tbp0) { seen = true; break; }
+                if (!seen)
+                {
+                    const int slot = s_lateN.fetch_add(1, std::memory_order_relaxed);
+                    if (slot < 8)
+                    {
+                        s_lateDumped[slot].store(ctx.tex0.tbp0, std::memory_order_relaxed);
+                        const auto &tx = ctx.tex0;
+                        const int dw = 1 << tx.tw, dh = 1 << tx.th;
+                        char path[128];
+                        std::snprintf(path, sizeof(path), "captures/g357_late_%x_cbp%x.ppm", tx.tbp0, tx.cbp);
+                        FILE *fp = std::fopen(path, "wb");
+                        if (fp)
+                        {
+                            std::fprintf(fp, "P6\n%d %d\n255\n", dw, dh);
+                            for (int yy = 0; yy < dh; ++yy)
+                                for (int xx = 0; xx < dw; ++xx)
+                                {
+                                    uint8_t ix = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tx.tbp0,
+                                                     tx.tbw >> 1, (uint32_t)xx, (uint32_t)yy));
+                                    uint32_t c = lookupCLUT(gs, ix, tx.cbp, tx.cpsm, tx.csm, tx.csa, tx.psm);
+                                    uint8_t rgb[3] = { (uint8_t)(c & 0xFF), (uint8_t)((c >> 8) & 0xFF), (uint8_t)((c >> 16) & 0xFF) };
+                                    std::fwrite(rgb, 1, 3, fp);
+                                }
+                            std::fclose(fp);
+                            std::fprintf(stderr, "[G357:latetex] wrote %s wn=%u\n", path, wn);
+                        }
+                    }
+                }
+            }
+            if (gs->m_prim.tme && ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tw >= 6 && ctx.tex0.th >= 6)
+            {
+                bool seen = false;
+                const int cap = s_dumpCount.load(std::memory_order_relaxed);
+                for (int i = 0; i < cap && i < 8; ++i)
+                    if (s_dumpedTbp[i].load(std::memory_order_relaxed) == ctx.tex0.tbp0) { seen = true; break; }
+                if (!seen)
+                {
+                    const int slot = s_dumpCount.fetch_add(1, std::memory_order_relaxed);
+                    if (slot < 8) { s_dumpedTbp[slot].store(ctx.tex0.tbp0, std::memory_order_relaxed); dumpThis = true; }
+                }
+            }
+            if (dumpThis)
+            {
+                const auto &tx = ctx.tex0;
+                const int dw = 1 << tx.tw, dh = 1 << tx.th;
+                char path[128];
+                std::snprintf(path, sizeof(path), "captures/g356_ct_%x_cbp%x.ppm", tx.tbp0, tx.cbp);
+                FILE *fp = std::fopen(path, "wb");
+                if (fp)
+                {
+                    std::fprintf(fp, "P6\n%d %d\n255\n", dw, dh);
+                    for (int yy = 0; yy < dh; ++yy)
+                        for (int xx = 0; xx < dw; ++xx)
+                        {
+                            uint8_t ix = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tx.tbp0,
+                                             tx.tbw >> 1, (uint32_t)xx, (uint32_t)yy));
+                            uint32_t c = lookupCLUT(gs, ix, tx.cbp, tx.cpsm, tx.csm, tx.csa, tx.psm);
+                            uint8_t rgb[3] = { (uint8_t)(c & 0xFF), (uint8_t)((c >> 8) & 0xFF), (uint8_t)((c >> 16) & 0xFF) };
+                            std::fwrite(rgb, 1, 3, fp);
+                        }
+                    std::fclose(fp);
+                    std::fprintf(stderr, "[G356:circtex] wrote %s dw=%d dh=%d tbw=%u cbp=0x%x csa=%u\n",
+                        path, dw, dh, tx.tbw, tx.cbp, (unsigned)tx.csa);
+                }
+            }
+        }
+    }
+
+    const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, a);
+    if (!alphaTest.writeFramebuffer)
+    {
+        if (phaseDiagnosticsEnabled())
+        {
+        static std::atomic<uint64_t> s_f30Alpha{0};
+        const uint64_t n = s_f30Alpha.fetch_add(1, std::memory_order_relaxed) + 1ull;
+        if (n <= 4ull || (n & 0x3FFFull) == 0ull)
+        {
+            std::fprintf(stderr, "[F30:px.alphaCull] n=%llu a=%u\n",
+                         static_cast<unsigned long long>(n), a);
+        }
+        }
+        return;
+    }
+
+    // PHASE F30: writePixel commit counter — track RGB-nonzero @ fbp=0x68 separately
+    if (phaseDiagnosticsEnabled())
+    {
+        static std::atomic<uint64_t> s_f30PxCommit68{0};
+        static std::atomic<uint64_t> s_f30PxRgbNz68{0};
+        static std::atomic<uint64_t> s_f30PxRgbNz68Logged{0};
+        if (ctx.frame.fbp == 0x68u)
+        {
+            const uint64_t k = s_f30PxCommit68.fetch_add(1, std::memory_order_relaxed) + 1ull;
+            const bool rgbNz = (r | g | b) != 0u;
+            if (rgbNz)
+            {
+                s_f30PxRgbNz68.fetch_add(1, std::memory_order_relaxed);
+                const uint64_t lg = s_f30PxRgbNz68Logged.fetch_add(1, std::memory_order_relaxed) + 1ull;
+                if (lg <= 8ull || (lg & 0x1FFFFull) == 0ull)
+                {
+                    std::fprintf(stderr,
+                                 "[F30:px.rgbNz68] lg=%llu x=%d y=%d rgba=%02x%02x%02x%02x\n",
+                                 static_cast<unsigned long long>(lg), x, y, r, g, b, a);
+                }
+            }
+            if ((k & 0xFFFFFull) == 0ull)
+            {
+                std::fprintf(stderr,
+                             "[F30:px.summary68] total=%llu rgbNz=%llu\n",
+                             static_cast<unsigned long long>(k),
+                             static_cast<unsigned long long>(s_f30PxRgbNz68.load()));
+            }
+        }
+    }
+
+    const uint32_t widthBlocks = (ctx.frame.fbw != 0u) ? ctx.frame.fbw : 1u;
+    const uint32_t bytesPerPixel =
+        (ctx.frame.psm == GS_PSM_CT16 || ctx.frame.psm == GS_PSM_CT16S) ? 2u : 4u;
+
+    uint32_t off = 0u;
+    if (ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24)
+    {
+        off = GSPSMCT32::addrPSMCT32(GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+                                     widthBlocks,
+                                     static_cast<uint32_t>(x),
+                                     static_cast<uint32_t>(y));
+    }
+    else
+    {
+        off = addrPSMCT16Family(GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+                                widthBlocks,
+                                ctx.frame.psm,
+                                static_cast<uint32_t>(x),
+                                static_cast<uint32_t>(y));
+    }
+
+    if (off + bytesPerPixel > gs->m_vramSize)
+        return;
+
+    // G219 (default-off, DC2_G219_SKYPX=1): watch writes landing in the qwords the [G219:dif]
+    // capture-vs-replay diff showed being zeroed (0x278400..) — identifies the clobbering draw.
+    // (The F51.2 watch below can't serve: renderQualityTraceEnabled() disables deferral itself.)
+    {
+        static const bool s_g219w2 = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219w2 && off >= 0x278400u && off < 0x278440u)
+        {
+            static std::atomic<uint32_t> s_g219wpn{0};
+            const uint32_t n = s_g219wpn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 400u || (n % 512u) == 0u)
+                std::fprintf(stderr,
+                    "[G219:wpx] n=%u off=0x%x xy=(%d,%d) fbp=0x%x fbw=%u fpsm=0x%x prim=%u tme=%u "
+                    "tbp=0x%x rgba=%02x,%02x,%02x,%02x replay=%u\n",
+                    n, off, x, y, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw),
+                    static_cast<uint32_t>(ctx.frame.psm), static_cast<uint32_t>(gs->m_prim.type),
+                    static_cast<uint32_t>(gs->m_prim.tme), ctx.tex0.tbp0, r, g, b, a,
+                    t_g144InReplay ? 1u : 0u);
+        }
+    }
+
+    // [F51.2] Watch writes that land in the manager texture page (0x272000..0x282000).
+    // Identify which draw zeroes the uploaded T8 data (pageNz drops 62381 -> ~8192).
+    if (renderQualityTraceEnabled() && off >= 0x272000u && off < 0x282000u)
+    {
+        static std::atomic<uint32_t> s_f512Watch{0};
+        const uint32_t wn = s_f512Watch.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const bool rgbZero = (r | g | b) == 0u;
+        if (wn <= 32u || (rgbZero && wn <= 2000u && (wn % 200u) == 0u))
+        {
+            std::fprintf(stderr,
+                "[F51.2:texwrite] wn=%u off=0x%x x=%d y=%d fbp=0x%x fbw=%u fpsm=0x%x "
+                "tme=%u abe=%u rgba=%02x,%02x,%02x,%02x tbp=0x%x tpsm=0x%x\n",
+                wn, off, x, y, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw),
+                static_cast<uint32_t>(ctx.frame.psm),
+                static_cast<uint32_t>(gs->m_prim.tme), static_cast<uint32_t>(gs->m_prim.abe),
+                r, g, b, a, ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm));
+        }
+    }
+
+    PS2_IF_AGRESSIVE_LOGS({
+        const uint32_t pixelIndex = s_debugPixelCount.fetch_add(1, std::memory_order_relaxed);
+        if (pixelIndex < 32u)
+        {
+            std::cout << "[gs:pixel] idx=" << pixelIndex
+                      << " xy=(" << x << "," << y << ")"
+                      << " rgba=(" << static_cast<uint32_t>(r) << ","
+                      << static_cast<uint32_t>(g) << ","
+                      << static_cast<uint32_t>(b) << ","
+                      << static_cast<uint32_t>(a) << ")"
+                      << " fbp=" << ctx.frame.fbp
+                      << " fbw=" << ctx.frame.fbw
+                      << " psm=0x" << std::hex << static_cast<uint32_t>(ctx.frame.psm) << std::dec
+                      << " off=0x" << std::hex << off << std::dec
+                      << std::endl;
+        }
+    });
+
+    PS2_IF_AGRESSIVE_LOGS({
+        if (ctx.frame.fbp == 150u &&
+            s_debugFbp150PixelCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
+        {
+            std::cout << "[gs:fbp150-pixel]"
+                      << " xy=(" << x << "," << y << ")"
+                      << " rgba=(" << static_cast<uint32_t>(r) << ","
+                      << static_cast<uint32_t>(g) << ","
+                      << static_cast<uint32_t>(b) << ","
+                      << static_cast<uint32_t>(a) << ")"
+                      << " scissor=(" << ctx.scissor.x0
+                      << "," << ctx.scissor.y0
+                      << ")-(" << ctx.scissor.x1
+                      << "," << ctx.scissor.y1 << ")"
+                      << " off=0x" << std::hex << off << std::dec << std::endl;
+        }
+    });
+
+    const uint8_t srcR = r;
+    const uint8_t srcG = g;
+    const uint8_t srcB = b;
+    const uint8_t srcA = a;
+
+#if defined(PS2X_G658_DIAG)
+    const int g658Stage = g658Mode6CpuActive(gs->m_prim.abe != 0u, ctx)
+        ? g658Mode6StageCpu() : 0;
+    if (g658Stage == 2 || g658Stage == 3)
+    {
+        // Exactly representable byte constants. Stage 2 isolates coverage; stage 3 retains the
+        // ordinary integer blend and therefore isolates destination/blend/writeback from sampling.
+        r = 0x5Au; g = 0xA5u; b = 0x3Cu; a = 0x40u;
+    }
+    if (g658Stage != 0)
+    {
+        static std::atomic<uint64_t> s_g658CpuPx{0};
+        const uint64_t n = s_g658CpuPx.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n == 1u || (n % 1000000u) == 0u)
+            std::fprintf(stderr, "[G658:cpu] stage=%d pixels=%llu\n", g658Stage,
+                         static_cast<unsigned long long>(n));
+    }
+#else
+    constexpr int g658Stage = g658Mode6StageCpu();
+#endif
+
+#if defined(PS2X_G659_DIAG)
+    // G659 P3/P5: the mode-6 rewrite-depth census needs the exact PRE-CLAMP subtrahend this write
+    // applies, not the clamped result — a clamped write is non-linear and cannot be inverted, so
+    // it is counted separately rather than folded into the sum.
+    bool g659M6 = false;
+    int g659SubG = 0;
+    bool g659ClampG = false;
+#endif
+    // Stages 1/2 compare the pre-blend source/coverage surface. Stage 3 follows the exact legacy
+    // integer blend below with a shared constant source.
+    if (gs->m_prim.abe && g658Stage != 1 && g658Stage != 2)
+    {
+        uint32_t existing = 0u;
+        if (bytesPerPixel == 2u)
+        {
+            uint16_t packed = 0u;
+            std::memcpy(&packed, gs->m_vram + off, 2);
+            existing = decodePSMCT16(packed);
+        }
+        else
+        {
+            std::memcpy(&existing, gs->m_vram + off, 4);
+        }
+        uint8_t dr = existing & 0xFF;
+        uint8_t dg = (existing >> 8) & 0xFF;
+        uint8_t db = (existing >> 16) & 0xFF;
+        uint8_t da = (existing >> 24) & 0xFF;
+
+        // PABE disables alpha blending when the source alpha MSB is clear.
+        if (!(gs->m_pabe && (a & 0x80u) == 0u))
+        {
+            uint64_t alphaReg = ctx.alpha;
+            uint8_t asel = alphaReg & 3;
+            uint8_t bsel = (alphaReg >> 2) & 3;
+            uint8_t csel = (alphaReg >> 4) & 3;
+            uint8_t dsel = (alphaReg >> 6) & 3;
+            uint8_t fix = static_cast<uint8_t>((alphaReg >> 32) & 0xFF);
+
+            auto pickRGB = [&](uint8_t sel, int cs, int cd) -> int
+            {
+                if (sel == 0)
+                    return cs;
+                if (sel == 1)
+                    return cd;
+                return 0;
+            };
+            int cAlpha = (csel == 0) ? a : (csel == 1) ? da
+                                                       : fix;
+
+#if defined(PS2X_G659_DIAG)
+            if (asel == 2u && bsel == 0u && csel == 0u && dsel == 1u)
+            {
+                const int rawG =
+                    ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) +
+                    pickRGB(dsel, g, dg);
+                g659M6 = true;
+                g659SubG = static_cast<int>(dg) - rawG;
+                g659ClampG = rawG < 0 || rawG > 255;
+            }
+#endif
+            r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
+            g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
+            b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
+            if (g258TraceOn() && g_g255Verify.pending && g_g255Verify.fbp == 0x146u &&
+                g_g255Verify.traceBatch <= 4u && x == 52 && y == 1)
+            {
+                const int nr = (pickRGB(asel, srcR, dr) - pickRGB(bsel, srcR, dr)) * cAlpha;
+                const int ng = (pickRGB(asel, srcG, dg) - pickRGB(bsel, srcG, dg)) * cAlpha;
+                const int nb = (pickRGB(asel, srcB, db) - pickRGB(bsel, srcB, db)) * cAlpha;
+                std::fprintf(stderr,
+                    "[G258:cpu.blend] batch=%llu entry=%zu dst=%02x%02x%02x%02x "
+                    "src=%02x%02x%02x%02x c=%d num=(%d,%d,%d) out=%02x%02x%02x%02x\n",
+                    static_cast<unsigned long long>(g_g255Verify.traceBatch), t_g258EntryIndex,
+                    dr, dg, db, da, srcR, srcG, srcB, srcA, cAlpha, nr, ng, nb,
+                    r, g, b, srcA);
+            }
+        }
+        else
+        {
+            r = srcR;
+            g = srcG;
+            b = srcB;
+        }
+    }
+
+    uint32_t mask = ctx.frame.fbmsk;
+    if (!alphaTest.preserveDestinationAlpha &&
+        (ctx.fba & 0x1ull) != 0ull &&
+        ctx.frame.psm != GS_PSM_CT24)
+    {
+        a = static_cast<uint8_t>(a | 0x80u);
+    }
+
+    if (bytesPerPixel == 2u)
+    {
+        uint16_t pixel = encodePSMCT16(r, g, b, a);
+        if ((mask & 0xFFFFu) != 0u)
+        {
+            uint16_t existing = 0u;
+            std::memcpy(&existing, gs->m_vram + off, 2);
+            pixel = static_cast<uint16_t>((pixel & ~mask) | (existing & mask));
+        }
+        if (g195ForegroundTraceTarget(ctx, x, y))
+        {
+            uint16_t before = 0u;
+            std::memcpy(&before, gs->m_vram + off, 2);
+            g195LogForegroundPixel(ctx, x, y, off, bytesPerPixel,
+                                   static_cast<uint32_t>(gs->m_prim.type),
+                                   gs->m_prim.tme, gs->m_prim.abe,
+                                   gs->m_prim.fst, gs->m_prim.ctxt, gs->m_pabe,
+                                   decodePSMCT16(before), srcR, srcG, srcB, srcA,
+                                   decodePSMCT16(pixel));
+        }
+        f50_12_log_framebuffer_commit(ctx, x, y, off, bytesPerPixel, decodePSMCT16(pixel),
+                                      gs->m_prim.type, gs->m_prim.tme, gs->m_prim.abe,
+                                      gs->m_prim.fst, gs->m_prim.ctxt);
+        std::memcpy(gs->m_vram + off, &pixel, 2);
+        return;
+    }
+
+    uint32_t pixel = static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8) | (static_cast<uint32_t>(b) << 16) | (static_cast<uint32_t>(a) << 24);
+
+    if (mask != 0)
+    {
+        uint32_t existing;
+        std::memcpy(&existing, gs->m_vram + off, 4);
+        pixel = (pixel & ~mask) | (existing & mask);
+    }
+
+    if (alphaTest.preserveDestinationAlpha)
+    {
+        uint32_t existing = 0u;
+        std::memcpy(&existing, gs->m_vram + off, 4);
+        pixel = (pixel & 0x00FFFFFFu) | (existing & 0xFF000000u);
+    }
+
+    if (g195ForegroundTraceTarget(ctx, x, y))
+    {
+        uint32_t before = 0u;
+        std::memcpy(&before, gs->m_vram + off, 4);
+        g195LogForegroundPixel(ctx, x, y, off, bytesPerPixel,
+                               static_cast<uint32_t>(gs->m_prim.type),
+                               gs->m_prim.tme, gs->m_prim.abe,
+                               gs->m_prim.fst, gs->m_prim.ctxt, gs->m_pabe,
+                               before, srcR, srcG, srcB, srcA, pixel);
+    }
+
+    if (g43FacePixelTraceEnabled() &&
+        ctx.frame.fbp == 0x139u &&
+        gs->m_prim.tme &&
+        x >= 344 && x <= 412 &&
+        y >= 76 && y <= 144 &&
+        ((x & 3) == 0) &&
+        ((y & 3) == 0))
+    {
+        static std::atomic<uint32_t> s_g43FacePx{0};
+        const uint32_t n = s_g43FacePx.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 4000u)
+        {
+            std::fprintf(stderr,
+                "[G43:px] n=%u xy=(%d,%d) prim=%u tme=%u abe=%u fst=%u iip=%u "
+                "tbp=0x%x tpsm=0x%x cbp=0x%x csa=%u src=%02x,%02x,%02x,%02x "
+                "final=0x%08x alpha=0x%llx test=0x%llx zbuf=0x%llx\n",
+                n, x, y,
+                static_cast<uint32_t>(gs->m_prim.type),
+                static_cast<uint32_t>(gs->m_prim.tme),
+                static_cast<uint32_t>(gs->m_prim.abe),
+                static_cast<uint32_t>(gs->m_prim.fst),
+                static_cast<uint32_t>(gs->m_prim.iip),
+                ctx.tex0.tbp0,
+                static_cast<uint32_t>(ctx.tex0.psm),
+                ctx.tex0.cbp,
+                static_cast<uint32_t>(ctx.tex0.csa),
+                srcR, srcG, srcB, a,
+                pixel,
+                static_cast<unsigned long long>(ctx.alpha),
+                static_cast<unsigned long long>(ctx.test),
+                static_cast<unsigned long long>(ctx.zbuf));
+        }
+    }
+
+    // G407 diagnostic: ordered writers of one exact display pixel over a bounded VSync window.
+    // Format: DC2_G407_PIXEL=x,y,minTick,maxTick. Default-off and behavior-neutral.
+    {
+        struct G407PixelProbe
+        {
+            bool enabled = false;
+            int x = 0;
+            int y = 0;
+            uint64_t minTick = 0;
+            uint64_t maxTick = ~0ull;
+        };
+        static const G407PixelProbe s_probe = []() {
+            G407PixelProbe p;
+            const char *e = std::getenv("DC2_G407_PIXEL");
+            unsigned long long lo = 0, hi = ~0ull;
+            if (e && std::sscanf(e, "%d,%d,%llu,%llu", &p.x, &p.y, &lo, &hi) == 4)
+            {
+                p.enabled = true;
+                p.minTick = static_cast<uint64_t>(lo);
+                p.maxTick = static_cast<uint64_t>(hi);
+            }
+            return p;
+        }();
+        const uint64_t tick =
+            s_probe.enabled ? ps2_syscalls::GetCurrentVSyncTick() : 0u;
+        if (s_probe.enabled && x == s_probe.x && y == s_probe.y &&
+            tick >= s_probe.minTick && tick <= s_probe.maxTick &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u || ctx.frame.fbp == 0x139u))
+        {
+            uint32_t before = 0u;
+            std::memcpy(&before, gs->m_vram + off, 4);
+            // Alpha-only field-copy sprites are very frequent here and cannot create the
+            // visible speck. Suppressing them keeps the diagnostic replay timing-identical.
+            if ((before & 0x00FFFFFFu) != (pixel & 0x00FFFFFFu))
+            {
+                static std::atomic<uint32_t> s_n{0};
+                const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 4000u)
+                    std::fprintf(stderr,
+                        "[G407:px] n=%u tick=%llu xy=(%d,%d) fbp=0x%x prim=%u tme=%u abe=%u fst=%u "
+                        "tbp=0x%x tpsm=0x%x tex1=0x%llx src=%02x,%02x,%02x,%02x "
+                        "before=%08x final=%08x alpha=0x%llx test=0x%llx "
+                        "v0=(%.3f,%.3f uv=%.3f,%.3f) v1=(%.3f,%.3f uv=%.3f,%.3f) "
+                        "v2=(%.3f,%.3f uv=%.3f,%.3f)\n",
+                        n, static_cast<unsigned long long>(tick), x, y, ctx.frame.fbp,
+                        static_cast<uint32_t>(gs->m_prim.type),
+                        static_cast<uint32_t>(gs->m_prim.tme),
+                        static_cast<uint32_t>(gs->m_prim.abe),
+                        static_cast<uint32_t>(gs->m_prim.fst),
+                        ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm),
+                        static_cast<unsigned long long>(ctx.tex1),
+                        srcR, srcG, srcB, srcA, before, pixel,
+                        static_cast<unsigned long long>(ctx.alpha),
+                        static_cast<unsigned long long>(ctx.test),
+                        gs->m_vtxQueue[0].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
+                        gs->m_vtxQueue[0].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
+                        static_cast<double>(gs->m_vtxQueue[0].u) / 16.0,
+                        static_cast<double>(gs->m_vtxQueue[0].v) / 16.0,
+                        gs->m_vtxQueue[1].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
+                        gs->m_vtxQueue[1].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
+                        static_cast<double>(gs->m_vtxQueue[1].u) / 16.0,
+                        static_cast<double>(gs->m_vtxQueue[1].v) / 16.0,
+                        gs->m_vtxQueue[2].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
+                        gs->m_vtxQueue[2].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
+                        static_cast<double>(gs->m_vtxQueue[2].u) / 16.0,
+                        static_cast<double>(gs->m_vtxQueue[2].v) / 16.0);
+            }
+        }
+    }
+
+    // G530: guarded by the SAME cached flag g407AutoRecord() tests on entry — see
+    // g407AutoScanEnabled() above. Exact; deletes a dependent VRAM load + a call per commit.
+    if (g407AutoScanEnabled())
+    {
+        uint32_t before = 0u;
+        std::memcpy(&before, gs->m_vram + off, 4);
+        g407AutoRecord(ctx,
+                       static_cast<uint32_t>(gs->m_prim.type),
+                       gs->m_prim.tme, gs->m_prim.abe, gs->m_prim.fst,
+                       x, y, before, pixel,
+                       srcR, srcG, srcB, srcA);
+    }
+
+    f50_12_log_framebuffer_commit(ctx, x, y, off, bytesPerPixel, pixel,
+                                  gs->m_prim.type, gs->m_prim.tme, gs->m_prim.abe,
+                                  gs->m_prim.fst, gs->m_prim.ctxt);
+#if defined(PS2X_G659_DIAG)
+    // The commit point: every test this pixel could still have failed is behind us.
+    g659NoteCpuWrite(ctx.frame.fbp, x, y, g659M6, g659SubG, g659ClampG);
+#endif
+    std::memcpy(gs->m_vram + off, &pixel, 4);
+}
+
+// F62 (PR #132): texel reads now go through the GSMem swizzle module. GSMem's
+// address math is byte-identical to the local GSPSMCT32/GSPSMT4 helpers (proven for
+// 32-bit and the index formats) and is the canonical swizzle for the 16-bit family
+// (which the old upload wrote linearly — see processImageData). GSMem takes the
+// buffer width in PAGES, so PSMT4's 128-wide page needs tbw>>1; the 32/24/16-bit and
+// the *H index formats (64-wide page) use tbw directly.
+uint32_t GSRasterizer::readTexelPSMCT32(GS *gs, uint32_t tbp0, uint32_t tbw, int texU, int texV)
+{
+    if (tbw == 0)
+        tbw = 1;
+    const uint32_t g365c = GSMem::ReadCT32(gs->m_vram, tbp0, tbw,
+                                           static_cast<uint32_t>(texU), static_cast<uint32_t>(texV));
+    // G365 (diagnostic, default-off): per-column census of the far-right texels fetched from the
+    // scene RTT (tbp 0x2720). Answers whether the right-edge line's colour comes OUT of VRAM.
+    {
+        static const bool s_g365r = (std::getenv("DC2_G365_WATCH") != nullptr);
+        if (s_g365r && tbp0 == 0x2720u && texU >= 500 && texU <= 511)
+        {
+            static std::atomic<uint64_t> s_n[12] = {};
+            static std::atomic<uint64_t> s_nz[12] = {};
+            static std::atomic<uint64_t> s_tot{0};
+            const int i = texU - 500;
+            s_n[i].fetch_add(1u, std::memory_order_relaxed);
+            if ((g365c & 0xFFFFFFu) != 0u) s_nz[i].fetch_add(1u, std::memory_order_relaxed);
+            const uint64_t tn = s_tot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if ((tn % 500000ull) == 0ull)
+            {
+                char buf[512]; int p = 0;
+                p += std::snprintf(buf + p, sizeof(buf) - p, "[G365:rd] n=%llu",
+                                   (unsigned long long)tn);
+                for (int k = 0; k < 12; ++k)
+                    p += std::snprintf(buf + p, sizeof(buf) - p, " u%d=%llu/%llu", 500 + k,
+                                       (unsigned long long)s_nz[k].load(std::memory_order_relaxed),
+                                       (unsigned long long)s_n[k].load(std::memory_order_relaxed));
+                std::fprintf(stderr, "%s (nonblack/total)\n", buf);
+            }
+        }
+    }
+    return g365c;
+}
+
+uint32_t GSRasterizer::readTexelPSMCT16(GS *gs, uint32_t tbp0, uint32_t tbw, int texU, int texV)
+{
+    if (tbw == 0)
+        tbw = 1;
+    const uint8_t psm = gs->activeContext().tex0.psm;
+    uint32_t raw;
+    switch (psm)
+    {
+    case GS_PSM_CT16S: raw = GSMem::ReadCT16S(gs->m_vram, tbp0, tbw, static_cast<uint32_t>(texU), static_cast<uint32_t>(texV)); break;
+    case GS_PSM_Z16:   raw = GSMem::ReadZ16  (gs->m_vram, tbp0, tbw, static_cast<uint32_t>(texU), static_cast<uint32_t>(texV)); break;
+    case GS_PSM_Z16S:  raw = GSMem::ReadZ16S (gs->m_vram, tbp0, tbw, static_cast<uint32_t>(texU), static_cast<uint32_t>(texV)); break;
+    default:           raw = GSMem::ReadCT16 (gs->m_vram, tbp0, tbw, static_cast<uint32_t>(texU), static_cast<uint32_t>(texV)); break;
+    }
+    return decodePSMCT16(static_cast<uint16_t>(raw));
+}
+
+uint32_t GSRasterizer::readTexelPSMT4(GS *gs, uint32_t tbp0, uint32_t tbw, int texU, int texV)
+{
+    if (tbw == 0)
+        tbw = 1;
+
+    const uint8_t psm = gs->activeContext().tex0.psm;
+    const uint32_t ux = static_cast<uint32_t>(texU);
+    const uint32_t uy = static_cast<uint32_t>(texV);
+
+    // T4HH/T4HL hide the 4-bit index in the upper byte of a 32-bit word (F37). GSMem's
+    // P4HH/P4HL readers (BitOffset 28/24 over the C32 page layout) extract exactly that
+    // nibble — byte-identical to the old upper-byte read.
+    if (psm == GS_PSM_T4HH)
+        return GSMem::ReadP4HH(gs->m_vram, tbp0, tbw, ux, uy);
+    if (psm == GS_PSM_T4HL)
+        return GSMem::ReadP4HL(gs->m_vram, tbp0, tbw, ux, uy);
+
+    // Plain PSMT4: 128-wide page → tbw>>1.
+    const uint32_t pageBwT4 = ((tbw >> 1u) != 0u) ? (tbw >> 1u) : 1u;
+    return GSMem::ReadP4(gs->m_vram, tbp0, pageBwT4, ux, uy);
+}
+
+uint32_t GSRasterizer::lookupCLUT(GS *gs,
+                                  uint8_t index,
+                                  uint32_t cbp,
+                                  uint8_t cpsm,
+                                  uint8_t csm,
+                                  uint8_t csa,
+                                  uint8_t sourcePsm)
+{
+    const uint32_t clutIndex = resolveClutIndex(index, csm, csa, sourcePsm);
+    const uint32_t clutWidth = (gs->m_texclut.cbw != 0u) ? static_cast<uint32_t>(gs->m_texclut.cbw) : 1u;
+    const uint32_t clutX = static_cast<uint32_t>(gs->m_texclut.cou) + (clutIndex & 0x0Fu);
+    const uint32_t clutY = static_cast<uint32_t>(gs->m_texclut.cov) + (clutIndex >> 4);
+
+    // F62 (PR #132): CLUT fetch via GSMem (CT32 == local addrPSMCT32, byte-identical;
+    // 16-bit uses the canonical swizzle). NOTE: unlike the PR's hunk, the 16-bit CLUT
+    // is still run through decodePSMCT16 (the PR dropped that, which would feed raw
+    // 5-5-5-1 into applyTexa).
+    switch (cpsm)
+    {
+    case GS_PSM_CT32:
+        return applyTexa(gs->m_texa, cpsm, GSMem::ReadCT32(gs->m_vram, cbp, clutWidth, clutX, clutY));
+    case GS_PSM_CT24:
+        return applyTexa(gs->m_texa, cpsm, GSMem::ReadCT24(gs->m_vram, cbp, clutWidth, clutX, clutY));
+    case GS_PSM_CT16:
+        return applyTexa(gs->m_texa, cpsm, decodePSMCT16(static_cast<uint16_t>(GSMem::ReadCT16(gs->m_vram, cbp, clutWidth, clutX, clutY))));
+    case GS_PSM_CT16S:
+        return applyTexa(gs->m_texa, cpsm, decodePSMCT16(static_cast<uint16_t>(GSMem::ReadCT16S(gs->m_vram, cbp, clutWidth, clutX, clutY))));
+    default:
+        break;
+    }
+
+    return 0xFFFF00FFu;
+}
+
+uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v)
+{
+    const auto &ctx = gs->activeContext();
+    const auto &tex = ctx.tex0;
+
+    int texW = 1 << tex.tw;
+    int texH = 1 << tex.th;
+
+    float texUf, texVf;
+    if (gs->m_prim.fst)
+    {
+        texUf = static_cast<float>(u) / 16.0f;
+        texVf = static_cast<float>(v) / 16.0f;
+    }
+    else
+    {
+        const float invQ = 1.0f / fabsQ(q);
+        texUf = s * invQ * static_cast<float>(texW);
+        texVf = t * invQ * static_cast<float>(texH);
+        // G408 diagnostic: PCSX2 SW converts S/Q and T/Q to signed 16.16
+        // texel coordinates before extracting bilinear integer/fraction fields.
+        static const bool s_g408FixedStq =
+            std::getenv("DC2_G408_PCSX2_FIXED_STQ") != nullptr;
+        if (s_g408FixedStq)
+        {
+            constexpr float kFixedScale = 65536.0f;
+            texUf = static_cast<float>(static_cast<int32_t>(texUf * kFixedScale)) / kFixedScale;
+            texVf = static_cast<float>(static_cast<int32_t>(texVf * kFixedScale)) / kFixedScale;
+        }
+        // G408 diagnostic: characterize the STQ sample phase independently of
+        // guest packets. Default-off; a nonzero value shifts all STQ texel-space
+        // coordinates before the ordinary point/linear sampler.
+        static const float s_g408StqBias = []() {
+            const char *e = std::getenv("DC2_G408_STQ_BIAS");
+            return (e && *e) ? static_cast<float>(std::atof(e)) : 0.0f;
+        }();
+        texUf += s_g408StqBias;
+        texVf += s_g408StqBias;
+    }
+
+    auto f50_12_log_pal_sample = [&](int sampleU, int sampleV, uint32_t idx, uint32_t color) {
+        if (!f50_12_trace_enabled())
+            return;
+
+        static std::atomic<uint64_t> s_total{0};
+        static std::atomic<uint64_t> s_bad{0};
+        static std::atomic<uint64_t> s_title{0};
+        static std::atomic<uint64_t> s_manager{0};
+        static std::atomic<uint64_t> s_other{0};
+
+        const bool bad = tex.tbp0 == 0x2580u && tex.cbp == 0x2980u && tex.cpsm == GS_PSM_CT16;
+        const bool title = tex.tbp0 == 0x1A00u && tex.cbp == 0x3FE0u;
+        const bool manager = tex.tbp0 == 0x2720u || tex.tbp0 == 0x2820u ||
+                             tex.tbp0 == 0x29A0u || tex.tbp0 == 0x2F20u ||
+                             tex.tbp0 == 0x3420u;
+        const char *bucket = "other";
+        std::atomic<uint64_t> *bucketCounter = &s_other;
+        if (bad)
+        {
+            bucket = "bad2580";
+            bucketCounter = &s_bad;
+        }
+        else if (title)
+        {
+            bucket = "title";
+            bucketCounter = &s_title;
+        }
+        else if (manager)
+        {
+            bucket = "manager";
+            bucketCounter = &s_manager;
+        }
+
+        const uint64_t n = s_total.fetch_add(1u, std::memory_order_relaxed) + 1ull;
+        const uint64_t bucketN = bucketCounter->fetch_add(1u, std::memory_order_relaxed) + 1ull;
+        const bool shouldLog = bucketN <= 32ull ||
+                               (bad && (bucketN % 1048576ull) == 0ull) ||
+                               (manager && (bucketN % 65536ull) == 0ull) ||
+                               ((n % 1048576ull) == 0ull);
+        if (!shouldLog)
+            return;
+
+        std::fprintf(stderr,
+                     "[F512:samples] n=%llu bucket=%s bucketN=%llu prim=%u tme=%u abe=%u fst=%u ctxt=%u fbp=0x%x fbw=%u fpsm=0x%x tex0=0x%016llx tbp=0x%x tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=0x%x cpsm=0x%x csm=%u csa=%u cld=%u texclut(cbw=%u,cou=%u,cov=%u) uv=(%d,%d) idx=%u color=0x%08x\n",
+                     static_cast<unsigned long long>(n),
+                     bucket,
+                     static_cast<unsigned long long>(bucketN),
+                     static_cast<uint32_t>(gs->m_prim.type),
+                     static_cast<uint32_t>(gs->m_prim.tme),
+                     static_cast<uint32_t>(gs->m_prim.abe),
+                     static_cast<uint32_t>(gs->m_prim.fst),
+                     static_cast<uint32_t>(gs->m_prim.ctxt),
+                     ctx.frame.fbp,
+                     static_cast<uint32_t>(ctx.frame.fbw),
+                     static_cast<uint32_t>(ctx.frame.psm),
+                     static_cast<unsigned long long>(f50_12_tex0_raw(tex)),
+                     tex.tbp0,
+                     static_cast<uint32_t>(tex.tbw),
+                     static_cast<uint32_t>(tex.psm),
+                     static_cast<uint32_t>(tex.tw),
+                     static_cast<uint32_t>(tex.th),
+                     static_cast<uint32_t>(tex.tcc),
+                     static_cast<uint32_t>(tex.tfx),
+                     tex.cbp,
+                     static_cast<uint32_t>(tex.cpsm),
+                     static_cast<uint32_t>(tex.csm),
+                     static_cast<uint32_t>(tex.csa),
+                     static_cast<uint32_t>(tex.cld),
+                     static_cast<uint32_t>(gs->m_texclut.cbw),
+                     static_cast<uint32_t>(gs->m_texclut.cou),
+                     static_cast<uint32_t>(gs->m_texclut.cov),
+                     sampleU,
+                     sampleV,
+                     idx,
+                     color);
+    };
+
+    const uint8_t wrapU = static_cast<uint8_t>(ctx.clamp & 0x3u);
+    const uint8_t wrapV = static_cast<uint8_t>((ctx.clamp >> 2u) & 0x3u);
+    const int minU = static_cast<int>((ctx.clamp >> 4u) & 0x3FFu);
+    const int maxU = static_cast<int>((ctx.clamp >> 14u) & 0x3FFu);
+    const int minV = static_cast<int>((ctx.clamp >> 24u) & 0x3FFu);
+    const int maxV = static_cast<int>((ctx.clamp >> 34u) & 0x3FFu);
+
+    auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+    {
+        const int rawU = sampleU;
+        sampleU = wrapTextureCoordinate(sampleU, wrapU, texW, minU, maxU);
+        sampleV = wrapTextureCoordinate(sampleV, wrapV, texH, minV, maxV);
+
+        // G365 (diagnostic, default-off): trace the far-right texel fetches of the scene RTT
+        // used as a texture (tbp 0x2720) while drawing the display buffer.
+        {
+            static const bool s_g365s = (std::getenv("DC2_G365_WATCH") != nullptr);
+            if (s_g365s && tex.tbp0 == 0x2720u && rawU >= 500)
+            {
+                const uint32_t c = readTexelPSMCT32(gs, tex.tbp0, tex.tbw, sampleU, sampleV);
+                static std::atomic<uint32_t> s_sn{0};
+                const uint32_t sn = s_sn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (sn <= 200u || (sn % 20000u) == 0u)
+                    std::fprintf(stderr,
+                        "[G365:tex] n=%u fbp=0x%x rawU=%d u=%d v=%d texW=%d texH=%d wrapU=%u minU=%d maxU=%d "
+                        "tbw=%u psm=0x%x fst=%u c=0x%08x\n",
+                        sn, ctx.frame.fbp, rawU, sampleU, sampleV, texW, texH, wrapU, minU, maxU,
+                        tex.tbw, (unsigned)tex.psm, (unsigned)gs->m_prim.fst, c);
+            }
+        }
+
+        if (tex.psm == GS_PSM_CT32 || tex.psm == GS_PSM_CT24)
+            return applyTexa(gs->m_texa, tex.psm, readTexelPSMCT32(gs, tex.tbp0, tex.tbw, sampleU, sampleV));
+
+        if (tex.psm == GS_PSM_CT16 || tex.psm == GS_PSM_CT16S)
+            return applyTexa(gs->m_texa, tex.psm, readTexelPSMCT16(gs, tex.tbp0, tex.tbw, sampleU, sampleV));
+
+        if (tex.psm == GS_PSM_T4 ||
+            tex.psm == GS_PSM_T4HL ||
+            tex.psm == GS_PSM_T4HH)
+        {
+            // G5: one-shot decode of DC2's 4HH debug-font atlas. This separates
+            // VRAM/CLUT extraction defects from coordinate wrapping defects.
+            // G446: this is the PER-TEXEL texture sampler, and `psm==T4HH && tbp0==0x1A00` is TRUE
+            // for every texel of DC2's debug-font/UI atlas on lean MAP-0 — so the third term ran a
+            // live getenv() ~1,500 times per frame on the GS worker, the thread whose span IS the
+            // frame. The G446 env census attributed 100% of all env reads on this route to this one
+            // literal. Read once (G268 idiom); the dump itself is unchanged and still one-shot.
+            static const bool s_g5DumpFont = envFlagEnabled("DC2_DUMP_FONT");
+            if (tex.psm == GS_PSM_T4HH && tex.tbp0 == 0x1A00u && s_g5DumpFont)
+            {
+                static std::atomic<uint32_t> s_dumped4hh{0};
+                if (s_dumped4hh.fetch_add(1u, std::memory_order_relaxed) == 0u)
+                {
+                    const int dw = 1 << tex.tw;
+                    const int dh = 1 << tex.th;
+                    char path[128];
+                    std::snprintf(path, sizeof(path), "captures/font4hh_%x.ppm", tex.tbp0);
+                    FILE *fp = std::fopen(path, "wb");
+                    if (fp)
+                    {
+                        std::fprintf(fp, "P6\n%d %d\n255\n", dw, dh);
+                        for (int yy = 0; yy < dh; ++yy)
+                        {
+                            for (int xx = 0; xx < dw; ++xx)
+                            {
+                                const uint8_t ix = static_cast<uint8_t>(
+                                    GSMem::ReadP4HH(gs->m_vram, tex.tbp0, tex.tbw,
+                                                   static_cast<uint32_t>(xx),
+                                                   static_cast<uint32_t>(yy)));
+                                const uint32_t c = lookupCLUT(gs, ix, tex.cbp, tex.cpsm,
+                                                              tex.csm, tex.csa, tex.psm);
+                                const uint32_t alpha = std::min<uint32_t>((c >> 24) & 0xFFu, 0x80u);
+                                const uint8_t rgb[3] = {
+                                    static_cast<uint8_t>(((c & 0xFFu) * alpha) / 0x80u),
+                                    static_cast<uint8_t>((((c >> 8) & 0xFFu) * alpha) / 0x80u),
+                                    static_cast<uint8_t>((((c >> 16) & 0xFFu) * alpha) / 0x80u)
+                                };
+                                std::fwrite(rgb, 1, 3, fp);
+                            }
+                        }
+                        std::fclose(fp);
+                    }
+
+                    const char *vramPath = "captures/font4hh_vram.bin";
+                    FILE *vramFp = std::fopen(vramPath, "wb");
+                    if (vramFp)
+                    {
+                        std::fwrite(gs->m_vram, 1, gs->m_vramSize, vramFp);
+                        std::fclose(vramFp);
+                    }
+
+                    std::fprintf(stderr,
+                                 "[G5:font4hh] path=%s vram=%s tbp=0x%x tbw=%u psm=0x%x size=%dx%d "
+                                 "cbp=0x%x cpsm=0x%x csa=%u csm=%u cld=%u clamp=0x%llx\n",
+                                 path, vramPath, tex.tbp0, static_cast<uint32_t>(tex.tbw),
+                                 static_cast<uint32_t>(tex.psm), dw, dh, tex.cbp,
+                                 static_cast<uint32_t>(tex.cpsm), static_cast<uint32_t>(tex.csa),
+                                 static_cast<uint32_t>(tex.csm), static_cast<uint32_t>(tex.cld),
+                                 static_cast<unsigned long long>(ctx.clamp));
+
+                    for (uint32_t bw = 1u; bw <= 16u; ++bw)
+                    {
+                        uint32_t nonzero = 0u;
+                        uint32_t hash = 2166136261u;
+                        for (int yy = 0; yy < dh; ++yy)
+                        {
+                            for (int xx = 0; xx < dw; ++xx)
+                            {
+                                const uint8_t ix = static_cast<uint8_t>(
+                                    GSMem::ReadP4HH(gs->m_vram, tex.tbp0, bw,
+                                                   static_cast<uint32_t>(xx),
+                                                   static_cast<uint32_t>(yy)));
+                                nonzero += (ix != 0u) ? 1u : 0u;
+                                hash = (hash ^ ix) * 16777619u;
+                            }
+                        }
+                        std::fprintf(stderr, "[G5:font4hh-bw] bw=%u nonzero=%u hash=0x%08x%s\n",
+                                     bw, nonzero, hash, (bw == tex.tbw) ? " active" : "");
+                    }
+
+                    for (uint32_t csa = 0u; csa < 32u; ++csa)
+                    {
+                        std::fprintf(stderr, "[G5:font4hh-csa] csa=%u", csa);
+                        for (uint32_t ix = 0u; ix < 16u; ++ix)
+                        {
+                            const uint32_t c = lookupCLUT(gs, static_cast<uint8_t>(ix), tex.cbp,
+                                                          tex.cpsm, tex.csm,
+                                                          static_cast<uint8_t>(csa), tex.psm);
+                            std::fprintf(stderr, " %08x", c);
+                        }
+                        std::fputc('\n', stderr);
+                    }
+                }
+            }
+
+            uint32_t idx = readTexelPSMT4(gs, tex.tbp0, tex.tbw, sampleU, sampleV);
+            uint32_t clutColor = lookupCLUT(gs, static_cast<uint8_t>(idx), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            f50_12_log_pal_sample(sampleU, sampleV, idx, clutColor);
+            if (renderQualityTraceEnabled())
+            {
+                // F50.10: capture paletted samples that are NOT the dominant tbp=0x2580
+                // material, to see whether the data-backed streamed textures (0x2820/
+                // 0x29a0/0x2f20, proven present in VRAM) are ever actually drawn.
+                if (tex.tbp0 != 0x2580u)
+                {
+                    static std::atomic<int> s_f510other{0};
+                    const int o = s_f510other.fetch_add(1, std::memory_order_relaxed);
+                    if (o < 48)
+                        std::fprintf(stderr,
+                                     "[F510:othertex] o=%d psm=0x%x tbp=0x%x tbw=%u cbp=0x%x cpsm=0x%x cld=%u idx=%u color=0x%08x\n",
+                                     o, (uint32_t)tex.psm, tex.tbp0, (uint32_t)tex.tbw,
+                                     tex.cbp, (uint32_t)tex.cpsm, (uint32_t)tex.cld, idx, clutColor);
+                }
+                static std::atomic<int> s_f508T4{0};
+                const int k = s_f508T4.fetch_add(1, std::memory_order_relaxed);
+                if (k < 96)
+                {
+                    const uint32_t cw = gs->m_texclut.cbw ? static_cast<uint32_t>(gs->m_texclut.cbw) : 1u;
+                    const uint32_t coff = GSPSMCT32::addrPSMCT32(tex.cbp, cw,
+                                                                 static_cast<uint32_t>(gs->m_texclut.cou),
+                                                                 gs->m_texclut.cov);
+                    uint32_t cbase = 0u;
+                    if (coff + 4u <= gs->m_vramSize)
+                        std::memcpy(&cbase, gs->m_vram + coff, 4);
+                    std::fprintf(stderr,
+                                 "[F508:t4clut] k=%d psm=0x%x tbp=0x%x tbw=%u cbp=0x%x cpsm=0x%x csa=%u cld=%u idx=%u color=0x%08x clutbase@0x%x=0x%08x\n",
+                                 k, static_cast<uint32_t>(tex.psm), tex.tbp0, static_cast<uint32_t>(tex.tbw),
+                                 tex.cbp, static_cast<uint32_t>(tex.cpsm), static_cast<uint32_t>(tex.csa),
+                                 static_cast<uint32_t>(tex.cld),
+                                 idx, clutColor, coff, cbase);
+                    // F50.9: one-time dump of BOTH GS contexts' TEX0 + active context, to
+                    // check whether the texture bind targeted one context while the draw
+                    // samples the (stale) other context (PRIM.CTXT mismatch).
+                    if (k == 0)
+                    {
+                        const auto &t0 = gs->m_ctx[0].tex0;
+                        const auto &t1 = gs->m_ctx[1].tex0;
+                        std::fprintf(stderr,
+                                     "[F509:ctxdump] primCtxt=%u activeIsT0=%d "
+                                     "ctx0(tbp=0x%x tbw=%u psm=0x%x cbp=0x%x cpsm=0x%x cld=%u) "
+                                     "ctx1(tbp=0x%x tbw=%u psm=0x%x cbp=0x%x cpsm=0x%x cld=%u)\n",
+                                     gs->m_prim.ctxt ? 1u : 0u, (&ctx == &gs->m_ctx[0]) ? 1 : 0,
+                                     t0.tbp0, (unsigned)t0.tbw, (unsigned)t0.psm, t0.cbp, (unsigned)t0.cpsm, (unsigned)t0.cld,
+                                     t1.tbp0, (unsigned)t1.tbw, (unsigned)t1.psm, t1.cbp, (unsigned)t1.cpsm, (unsigned)t1.cld);
+                    }
+                    // F50.9: one-time dump of the actual upload destinations seen in the
+                    // BITBLTBUF histogram (textures @0x2820/0x29a0/0x2f20, CLUTs @0x3fb4..0x3fbc)
+                    // to confirm the uploaded data physically landed, vs the (empty) pages the
+                    // draws reference (tbp=0x2580 cbp=0x2980).
+                    if (k == 60)
+                    {
+                        auto dwAt = [&](uint32_t blk) -> uint32_t {
+                            const uint32_t byteOff = blk * 256u;
+                            uint32_t w = 0u;
+                            if (byteOff + 4u <= gs->m_vramSize)
+                                std::memcpy(&w, gs->m_vram + byteOff, 4);
+                            return w;
+                        };
+                        // Count nonzero bytes per 64KB region across all of VRAM so we can see
+                        // WHERE uploaded image data actually landed (vs the empty draw pages).
+                        auto nzRegion = [&](uint32_t startByte, uint32_t len) -> uint32_t {
+                            uint32_t nz = 0u;
+                            const uint32_t end = (startByte + len <= gs->m_vramSize) ? (startByte + len) : gs->m_vramSize;
+                            for (uint32_t i = startByte; i < end; ++i)
+                                if (gs->m_vram[i] != 0u) ++nz;
+                            return nz;
+                        };
+                        std::fprintf(stderr,
+                                     "[F508:vramdump] tex@0x2820=0x%08x tex@0x29a0=0x%08x tex@0x2f20=0x%08x "
+                                     "clut@0x3fb4=0x%08x clut@0x3fb8=0x%08x clut@0x3fbc=0x%08x clut@0x3fe0=0x%08x "
+                                     "drawTex@0x2580=0x%08x drawClut@0x2980=0x%08x vramSize=0x%x\n",
+                                     dwAt(0x2820u), dwAt(0x29a0u), dwAt(0x2f20u),
+                                     dwAt(0x3fb4u), dwAt(0x3fb8u), dwAt(0x3fbcu), dwAt(0x3fe0u),
+                                     dwAt(0x2580u), dwAt(0x2980u), gs->m_vramSize);
+                        // 0x100000-byte (1MB) buckets across 4MB VRAM.
+                        std::fprintf(stderr,
+                                     "[F508:vramnz] nz[0-1MB]=%u nz[1-2MB]=%u nz[2-3MB]=%u nz[3-4MB]=%u "
+                                     "nz@tex0x258000(64K)=%u nz@tex0x282000(64K)=%u nz@clut0x3fb000(16K)=%u\n",
+                                     nzRegion(0x000000u, 0x100000u), nzRegion(0x100000u, 0x100000u),
+                                     nzRegion(0x200000u, 0x100000u), nzRegion(0x300000u, 0x100000u),
+                                     nzRegion(0x258000u, 0x10000u), nzRegion(0x282000u, 0x10000u),
+                                     nzRegion(0x3fb000u, 0x4000u));
+                    }
+                }
+            }
+            return clutColor;
+        }
+
+        if (tex.psm == GS_PSM_T8)
+        {
+            if (tex.tbw == 0)
+                return 0xFFFF00FFu;
+            // G2: one-shot dump of the decoded T8 atlas as the sampler sees it (full
+            // tw/th, GSMem::ReadP8 -> lookupCLUT). DC2_DUMP_FONT=1. Reveals whether the
+            // CT32-alias upload + T8 read recover a coherent glyph atlas, or garbage.
+            {
+                static const bool s_dumpFont = []() {
+                    const char *e = std::getenv("DC2_DUMP_FONT");
+                    return e && e[0] != '0';
+                }();
+                if (s_dumpFont)
+                {
+                    static std::atomic<uint32_t> s_dumped{0};
+                    // dump each distinct font-ish tbp once
+                    static std::atomic<uint32_t> s_seen2720{0}, s_seen2f20{0}, s_seen3220{0}, s_seen2aa0{0};
+                    std::atomic<uint32_t> *seen =
+                        (tex.tbp0 == 0x2720u) ? &s_seen2720 :
+                        (tex.tbp0 == 0x2f20u) ? &s_seen2f20 :
+                        (tex.tbp0 == 0x2aa0u) ? &s_seen2aa0 :
+                        (tex.tbp0 == 0x3220u) ? &s_seen3220 : nullptr;
+                    if (seen && seen->fetch_add(1u, std::memory_order_relaxed) == 0u && s_dumped.load() < 6u)
+                    {
+                        s_dumped.fetch_add(1u, std::memory_order_relaxed);
+                        const int dw = 1 << tex.tw, dh = 1 << tex.th;
+                        for (uint32_t bwv = 1u; bwv <= 4u; ++bwv)
+                        {
+                            char path[128];
+                            std::snprintf(path, sizeof(path), "captures/font_%x_bw%u.ppm", tex.tbp0, bwv);
+                            FILE *fp = std::fopen(path, "wb");
+                            if (!fp) continue;
+                            std::fprintf(fp, "P6\n%d %d\n255\n", dw, dh);
+                            for (int yy = 0; yy < dh; ++yy)
+                                for (int xx = 0; xx < dw; ++xx)
+                                {
+                                    uint8_t ix = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tex.tbp0, bwv,
+                                                     static_cast<uint32_t>(xx), static_cast<uint32_t>(yy)));
+                                    uint32_t c = lookupCLUT(gs, ix, tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+                                    uint8_t rgb[3] = { static_cast<uint8_t>(c & 0xFF),
+                                                       static_cast<uint8_t>((c >> 8) & 0xFF),
+                                                       static_cast<uint8_t>((c >> 16) & 0xFF) };
+                                    std::fwrite(rgb, 1, 3, fp);
+                                }
+                            std::fclose(fp);
+                        }
+                        {
+                            std::fprintf(stderr, "[G2:fontdump] wrote %x bw-sweep dw=%d dh=%d tbw=%u cbp=0x%x cpsm=%u csa=%u\n",
+                                tex.tbp0, dw, dh, tex.tbw, tex.cbp, (unsigned)tex.cpsm, (unsigned)tex.csa);
+                        }
+                        // Variant 2: read the page as RAW LINEAR bytes (base + y*dw + x),
+                        // i.e. exactly how a flat host buffer would lay it out. If THIS is
+                        // legible, the data landed linearly and the T8 swizzle read is wrong.
+                        char path2[128];
+                        std::snprintf(path2, sizeof(path2), "captures/font_%x_linear.ppm", tex.tbp0);
+                        FILE *fp2 = std::fopen(path2, "wb");
+                        if (fp2)
+                        {
+                            const uint32_t base = tex.tbp0 * 256u;
+                            std::fprintf(fp2, "P6\n%d %d\n255\n", dw, dh);
+                            for (int yy = 0; yy < dh; ++yy)
+                                for (int xx = 0; xx < dw; ++xx)
+                                {
+                                    const uint32_t o = base + static_cast<uint32_t>(yy * dw + xx);
+                                    uint8_t ix = (o < gs->m_vramSize) ? gs->m_vram[o] : 0u;
+                                    uint32_t c = lookupCLUT(gs, ix, tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+                                    uint8_t rgb[3] = { static_cast<uint8_t>(c & 0xFF),
+                                                       static_cast<uint8_t>((c >> 8) & 0xFF),
+                                                       static_cast<uint8_t>((c >> 16) & 0xFF) };
+                                    std::fwrite(rgb, 1, 3, fp2);
+                                }
+                            std::fclose(fp2);
+                        }
+                        // G3: raw page-region snapshot at SAMPLE time. Compare vs the
+                        // post-upload snapshot ([G3:postup]) to detect an overwrite of
+                        // the font page between upload and sampling. DC2_DUMP_VRAMRGN=1.
+                        {
+                            const char *er = std::getenv("DC2_DUMP_VRAMRGN");
+                            if (er && er[0] != '0')
+                            {
+                                const uint32_t rbase = tex.tbp0 * 256u;
+                                const uint32_t rlen = 0x40000u;
+                                if (rbase + rlen <= gs->m_vramSize)
+                                {
+                                    char pr[128];
+                                    std::snprintf(pr, sizeof(pr), "captures/vram_atsample_%x.bin", tex.tbp0);
+                                    FILE *fpr = std::fopen(pr, "wb");
+                                    if (fpr) { std::fwrite(gs->m_vram + rbase, 1, rlen, fpr); std::fclose(fpr); }
+                                    std::fprintf(stderr, "[G3:atsample] wrote %s\n", pr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // [F51.3] env-gated experiment: override the PSMT8 sample stride. DC2 uploads its
+            // manager T8 textures via a CT32 alias (BITBLT dbw=2) but declares TEX0.TBW=6
+            // (< TW-width/64=8); the upload-consistent stride is dbw*2=4. Default OFF (no behavior
+            // change) — set DC2_T8_ALIAS_TBW=4 to test whether this makes the dungeon non-black.
+            uint32_t t8tbw = tex.tbw;
+            {
+                static const int s_aliasTbw = []() {
+                    const char *e = std::getenv("DC2_T8_ALIAS_TBW");
+                    return e ? std::atoi(e) : 0;
+                }();
+                if (s_aliasTbw > 0)
+                    t8tbw = static_cast<uint32_t>(s_aliasTbw);
+            }
+            uint32_t off = GSPSMT8::addrPSMT8(tex.tbp0, t8tbw, static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV));
+            if (renderQualityTraceEnabled())
+            {
+                static std::atomic<int> s_t8Probe{0};
+                if (s_t8Probe.fetch_add(1, std::memory_order_relaxed) < 5)
+                {
+                    uint8_t vb = (off < gs->m_vramSize) ? gs->m_vram[off] : 0xFFu;
+                    std::fprintf(stderr, "[F37:t8-sample] tbp=0x%x tbw=%u uv=(%d,%d) off=0x%x vram_byte=0x%02x cbp=0x%x cpsm=%u csm=%u\n",
+                        tex.tbp0, tex.tbw, sampleU, sampleV, off, vb, tex.cbp, tex.cpsm, tex.csm);
+                }
+                // G2 self-check: is GSMem::ReadP8 byte-identical to the local addrPSMT8 read?
+                // If g!=l ever fires, the swizzles differ; if never, the read fix is a no-op
+                // and the corruption is upstream (CT32-alias upload / wrong format).
+                {
+                    static std::atomic<int> s_g2chk{0};
+                    static std::atomic<int> s_g2mismatch{0};
+                    const uint32_t pageBwT8 = ((t8tbw >> 1u) != 0u) ? (t8tbw >> 1u) : 1u;
+                    uint8_t lb = (off < gs->m_vramSize) ? gs->m_vram[off] : 0xFFu;
+                    uint8_t gb = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tex.tbp0, pageBwT8,
+                                     static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV)));
+                    if (lb != gb) s_g2mismatch.fetch_add(1, std::memory_order_relaxed);
+                    int n = s_g2chk.fetch_add(1, std::memory_order_relaxed);
+                    if (n < 16 || (lb != gb && n < 4096 && (n % 64) == 0))
+                        std::fprintf(stderr, "[G2:t8cmp] n=%d tbp=0x%x tbw=%u uv=(%d,%d) local=0x%02x gsmem=0x%02x %s mism=%d\n",
+                            n, tex.tbp0, t8tbw, sampleU, sampleV, lb, gb, (lb==gb?"EQ":"DIFF"),
+                            s_g2mismatch.load(std::memory_order_relaxed));
+                }
+                // F51: one-shot per-TBW scan for the manager texture. The CT32-alias
+                // upload uses BITBLTBUF.DBW; the sampler reads addrPSMT8 with TEX0.TBW.
+                // Probe which TBW (if any) makes the sampled texel land on uploaded data,
+                // to decide whether the upload page-stride (DBW) or the sample TBW is off.
+                if (tex.tbp0 == 0x2720u)
+                {
+                    static std::atomic<int> s_t8tbw{0};
+                    if (s_t8tbw.fetch_add(1, std::memory_order_relaxed) < 4)
+                    {
+                        char line[384];
+                        int n = std::snprintf(line, sizeof(line),
+                            "[F51:tbwscan] uv=(%d,%d) sampleTbw=%u:",
+                            sampleU, sampleV, static_cast<uint32_t>(tex.tbw));
+                        for (uint32_t tw = 2u; tw <= 8u && n > 0 && n < (int)sizeof(line); ++tw)
+                        {
+                            uint32_t o = GSPSMT8::addrPSMT8(tex.tbp0, tw,
+                                static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV));
+                            uint8_t b = (o < gs->m_vramSize) ? gs->m_vram[o] : 0xFFu;
+                            n += std::snprintf(line + n, sizeof(line) - n,
+                                " tbw%u=0x%02x@0x%x", tw, b, o);
+                        }
+                        // locate the first nonzero byte in the CT32-written window (pages 0x139..0x141)
+                        uint32_t firstNz = 0u; uint8_t firstNzB = 0u;
+                        for (uint32_t a = 0x272000u; a < 0x282000u && a < gs->m_vramSize; ++a)
+                            if (gs->m_vram[a] != 0u) { firstNz = a; firstNzB = gs->m_vram[a]; break; }
+                        // linear nonzero count of the whole 64KB page at SAMPLE time. Compare vs
+                        // upload's nzT8=62381: ~62000 => data present (read at wrong addr = swizzle bug);
+                        // ~0 => data overwritten (RTT/clear corruption).
+                        uint32_t pageNz = 0u;
+                        for (uint32_t a = 0x272000u; a < 0x282000u && a < gs->m_vramSize; ++a)
+                            if (gs->m_vram[a] != 0u) ++pageNz;
+                        std::fprintf(stderr, "%s | firstNz@0x%x=0x%02x pageNz=%u\n", line, firstNz, firstNzB, pageNz);
+                    }
+                }
+            }
+            // G2: route the PSMT8 read through the byte-exact GSMem swizzle (like the F62
+            // T8 *upload* GSMem::WriteP8, and the T4/CT32/CT16 reads). The old local
+            // GSPSMT8::addrPSMT8 is NOT byte-identical to GSMem's P8 page/column table, so
+            // textures DC2 uploads via a CT32-alias BITBLT (dpsm=CT32, written by byte-exact
+            // GSMem::WriteCT32) and then samples as T8 came back garbled — this is the
+            // menu/dialog/HUD font-atlas corruption (fonts are T8: tbp 0x2720/0x2f20, cbp
+            // CT32). GSMem buffer width is in PAGES (T8 page = 128 wide) → tbw>>1, symmetric
+            // with the upload. Default ON; DC2_T8_GSMEM=0 falls back to the old path for A/B.
+            static const bool s_t8Gsmem = []() {
+                const char *e = std::getenv("DC2_T8_GSMEM");
+                return !(e && (e[0] == '0'));
+            }();
+            uint8_t idx;
+            if (s_t8Gsmem)
+            {
+                const uint32_t pageBwT8 = ((t8tbw >> 1u) != 0u) ? (t8tbw >> 1u) : 1u;
+                idx = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tex.tbp0, pageBwT8,
+                                                         static_cast<uint32_t>(sampleU),
+                                                         static_cast<uint32_t>(sampleV)));
+            }
+            else
+            {
+                if (off >= gs->m_vramSize)
+                    return 0xFFFF00FFu;
+                idx = gs->m_vram[off];
+            }
+            uint32_t clutColor = lookupCLUT(gs, idx, tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            // [G360] item-grid gray-panel decode probe (default OFF, DC2_G360_GRAYBG=1). The item
+            // slot backgrounds are CT32-aliased PSMT8 at tbp=0x2b20/cbp=0x3fb4 and VANISH (the
+            // blend is Cs*As+Cd*(1-As) with As=texture-alpha, so alpha~0 => brown shows through)
+            // while the directly-T8-uploaded icons render. Log idx + decoded RGBA to pin whether
+            // the index read (upload/addr) or the CLUT alpha is wrong.
+            {
+                static const bool s_g360 = (std::getenv("DC2_G360_GRAYBG") != nullptr);
+                if (s_g360 && tex.tbp0 == 0x2b20u)
+                {
+                    static std::atomic<int> s_g360n{0};
+                    const int gn = s_g360n.fetch_add(1, std::memory_order_relaxed);
+                    if (gn < 96)
+                        std::fprintf(stderr,
+                            "[G360:graybg] n=%d tbw=%u uv=(%d,%d) pageBwT8=%u idx=%u clut=0x%08x A=%u cbp=0x%x cpsm=%u csa=%u\n",
+                            gn, static_cast<uint32_t>(t8tbw), sampleU, sampleV,
+                            (((t8tbw >> 1u) != 0u) ? (t8tbw >> 1u) : 1u), static_cast<uint32_t>(idx),
+                            clutColor, static_cast<uint32_t>((clutColor >> 24) & 0xFFu), tex.cbp,
+                            static_cast<uint32_t>(tex.cpsm), static_cast<uint32_t>(tex.csa));
+                }
+            }
+            f50_12_log_pal_sample(sampleU, sampleV, idx, clutColor);
+            // [F51.5] decisive: the displayed map texture is tbp=0x3220. Log its actual idx/color.
+            // idx==0 -> texture reads 0 at the sampled UV (UV/overwrite); idx!=0 && color==0 -> CLUT
+            // lookup broken (same class as 0x1a00 with the never-uploaded 0x3fe0 CLUT).
+            if (renderQualityTraceEnabled() && tex.tbp0 == 0x3220u)
+            {
+                static std::atomic<int> s_f515{0};
+                if (s_f515.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr,
+                        "[F51.5:mapsample] tbp=0x3220 tbw=%u uv=(%d,%d) off=0x%x byte=0x%02x idx=%u "
+                        "cbp=0x%x cpsm=%u csa=%u cld=%u color=0x%08x\n",
+                        static_cast<uint32_t>(tex.tbw), sampleU, sampleV, off,
+                        (off < gs->m_vramSize ? gs->m_vram[off] : 0xFFu), static_cast<uint32_t>(idx),
+                        tex.cbp, static_cast<uint32_t>(tex.cpsm), static_cast<uint32_t>(tex.csa),
+                        static_cast<uint32_t>(tex.cld), clutColor);
+            }
+            return clutColor;
+        }
+
+        // F62 (PR #132): formats the old sampler returned magenta for. GSMem decodes
+        // them; DC2 is not known to source these as textures, so this only adds
+        // coverage (no change for the CT32/CT16/T4/T8 paths above).
+        if (tex.psm == GS_PSM_T8H)
+        {
+            const uint32_t idx = GSMem::ReadP8H(gs->m_vram, tex.tbp0, tex.tbw,
+                                                static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV));
+            return lookupCLUT(gs, static_cast<uint8_t>(idx), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+        }
+        if (tex.psm == GS_PSM_Z32)
+            return applyTexa(gs->m_texa, tex.psm, GSMem::ReadZ32(gs->m_vram, tex.tbp0, tex.tbw, static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV)));
+        if (tex.psm == GS_PSM_Z24)
+            return applyTexa(gs->m_texa, tex.psm, GSMem::ReadZ24(gs->m_vram, tex.tbp0, tex.tbw, static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV)));
+        if (tex.psm == GS_PSM_Z16)
+            return applyTexa(gs->m_texa, tex.psm, decodePSMCT16(static_cast<uint16_t>(GSMem::ReadZ16(gs->m_vram, tex.tbp0, tex.tbw, static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV)))));
+        if (tex.psm == GS_PSM_Z16S)
+            return applyTexa(gs->m_texa, tex.psm, decodePSMCT16(static_cast<uint16_t>(GSMem::ReadZ16S(gs->m_vram, tex.tbp0, tex.tbw, static_cast<uint32_t>(sampleU), static_cast<uint32_t>(sampleV)))));
+
+        return 0xFFFF00FFu;
+    };
+
+    // G45 experiment: the costume head's detailed face texture is point-sampled at native
+    // 512-wide res, so its dark detail texels (nose/brow/freckle) pop as hard dots vs PCSX2's
+    // upscaled+filtered smooth face. Optionally force bilinear for the costume model RTT only.
+    static const bool s_g45Bilinear = (std::getenv("DC2_G45_BILINEAR") != nullptr);
+    const bool g45ForceLinear = s_g45Bilinear && gs->activeContext().frame.fbp == 0x139u;
+
+    // G51: minification box-filter for the costume model RTT. The face texture (0x3480) is a
+    // detailed 128x128 with fine dark feature texels (brows/eye-liner/nostril/lip/eye-socket
+    // shadow); it is minified ~2.5x onto the ~50px on-screen face. Point sampling (and even a 2x2
+    // bilinear tap) skips texels between samples -> the dark features ALIAS into scattered dark
+    // "speckle" dots, vs PCSX2's internal-res-upscaled smooth reference. Average a (2k+1)^2 texel
+    // box around the sample to approximate area minification. Scoped to fbp==0x139; env-gated
+    // DC2_G51_MINFILT = box radius k in texels (0 = off). Decisive root-cause test + the fix.
+    static const int s_g51MinFilt = []() -> int {
+        const char *e = std::getenv("DC2_G51_MINFILT");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (s_g51MinFilt > 0 && gs->activeContext().frame.fbp == 0x139u)
+    {
+        const int cu = static_cast<int>(std::floor(texUf));
+        const int cv = static_cast<int>(std::floor(texVf));
+        int rsum = 0, gsum = 0, bsum = 0, asum = 0, cnt = 0;
+        for (int dv = -s_g51MinFilt; dv <= s_g51MinFilt; ++dv)
+            for (int du = -s_g51MinFilt; du <= s_g51MinFilt; ++du)
+            {
+                const uint32_t c = samplePoint(cu + du, cv + dv);
+                rsum += static_cast<int>(c & 0xFFu);
+                gsum += static_cast<int>((c >> 8) & 0xFFu);
+                bsum += static_cast<int>((c >> 16) & 0xFFu);
+                asum += static_cast<int>((c >> 24) & 0xFFu);
+                ++cnt;
+            }
+        const uint32_t rr = static_cast<uint32_t>(rsum / cnt);
+        const uint32_t gg = static_cast<uint32_t>(gsum / cnt);
+        const uint32_t bb = static_cast<uint32_t>(bsum / cnt);
+        const uint32_t aa = static_cast<uint32_t>(asum / cnt);
+        return rr | (gg << 8) | (bb << 16) | (aa << 24);
+    }
+
+    if (!g45ForceLinear && !tex1UsesLinearFilter(ctx.tex1))
+    {
+        const uint32_t sampled = samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        if (renderQualityTraceEnabled())
+            f508LogSample(tex.psm, sampled);
+        return sampled;
+    }
+
+    const float sampleU = texUf - 0.5f;
+    const float sampleV = texVf - 0.5f;
+    const int u0 = static_cast<int>(std::floor(sampleU));
+    const int v0 = static_cast<int>(std::floor(sampleV));
+    const int u1 = u0 + 1;
+    const int v1 = v0 + 1;
+    const float fx = sampleU - static_cast<float>(u0);
+    const float fy = sampleV - static_cast<float>(v0);
+
+    const uint32_t c00 = samplePoint(u0, v0);
+    const uint32_t c10 = samplePoint(u1, v0);
+    const uint32_t c01 = samplePoint(u0, v1);
+    const uint32_t c11 = samplePoint(u1, v1);
+
+    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
+                                  static_cast<uint8_t>(c10 & 0xFFu),
+                                  static_cast<uint8_t>(c01 & 0xFFu),
+                                  static_cast<uint8_t>(c11 & 0xFFu),
+                                  fx, fy);
+    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
+                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
+                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
+                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
+                                  fx, fy);
+    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
+                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
+                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
+                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
+                                  fx, fy);
+    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
+                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
+                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
+                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
+                                  fx, fy);
+
+    const uint32_t sampledLinear = static_cast<uint32_t>(r) |
+           (static_cast<uint32_t>(g) << 8) |
+           (static_cast<uint32_t>(b) << 16) |
+           (static_cast<uint32_t>(a) << 24);
+    if (renderQualityTraceEnabled())
+        f508LogSample(tex.psm, sampledLinear);
+    return sampledLinear;
+}

@@ -1,0 +1,19 @@
+{
+  "id": "example_mod",
+  "name": "Example Mod (loader self-test)",
+  "version": "1.0.0",
+  "loadOrder": 100,
+  "enabled": true,
+  "env": {
+    "DC2_TRACE_MODS": 1
+  },
+  "overlays": {
+    "/MODDING_TEST.txt": "files/readme.txt"
+  },
+  "patches": [
+    {
+      "address": "0x01FFF000",
+      "bytes": "DE AD BE EF"
+    }
+  ]
+}

@@ -1,0 +1,1573 @@
+#include <filesystem>
+
+void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+{
+    m_vram = vram;
+    m_vramSize = vramSize;
+    m_privRegs = privRegs;
+    reset();
+}
+
+void GS::reset()
+{
+    G508StateLock lock(m_stateMutex);
+    std::memset(m_ctx, 0, sizeof(m_ctx));
+    m_prim = {};
+    m_curR = 0x80;
+    m_curG = 0x80;
+    m_curB = 0x80;
+    m_curA = 0x80;
+    m_curQ = 1.0f;
+    m_curS = 0.0f;
+    m_curT = 0.0f;
+    m_curU = 0;
+    m_curV = 0;
+    m_curFog = 0;
+    m_prmodecont = true;
+    m_pabe = false;
+    m_texa = {0u, false, 0u};
+    m_texclut = {0u, 0u, 0u};
+    m_bitbltbuf = {};
+    m_trxpos = {};
+    m_trxreg = {};
+    m_trxdir = 3;
+    m_hwregX = 0;
+    m_hwregY = 0;
+    m_vtxCount = 0;
+    m_vtxIndex = 0;
+    m_localToHostBuffer.clear();
+    m_localToHostReadPos = 0;
+    m_preferredDisplaySourceFrame = {};
+    m_preferredDisplayDestFbp = 0;
+    m_hasPreferredDisplaySource = false;
+    // G189: the host-presentation snapshot fields are guarded by the dedicated
+    // s_g189HostPresentMutex, not m_stateMutex (already held above) — nest the lock rather
+    // than reordering, since this is the only site that ever takes both (safe: every other
+    // site takes at most one of the two, so there is no lock-order-inversion risk).
+    {
+        std::lock_guard<std::mutex> presentLock(s_g189HostPresentMutex);
+        m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = 0u;
+        m_hostPresentationHeight = 0u;
+        m_hostPresentationDisplayFbp = 0u;
+        m_hostPresentationSourceFbp = 0u;
+        m_hostPresentationUsedPreferred = false;
+        m_hasHostPresentationFrame = false;
+    }
+    // G176: reset clears the snapshot — advance the generation so present re-reads it.
+    s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
+    g176_notify_frame_latched();
+    s_pendingImageBytes = 0u;
+    s_f31UploadPresentationCandidate = {};
+
+    for (int i = 0; i < 2; ++i)
+    {
+        m_ctx[i].frame.fbw = 10;
+        m_ctx[i].scissor = {0, 639, 0, 447};
+        m_ctx[i].xyoffset = {0, 0};
+    }
+}
+
+GSContext &GS::activeContext()
+{
+    return m_ctx[m_prim.ctxt ? 1 : 0];
+}
+
+void GS::snapshotVRAM()
+{
+    G508StateLock stateLock(m_stateMutex);
+    if (!m_vram || m_vramSize == 0)
+        return;
+    std::lock_guard<std::mutex> lock(m_snapshotMutex);
+    m_displaySnapshot.resize(m_vramSize);
+    std::memcpy(m_displaySnapshot.data(), m_vram, m_vramSize);
+}
+
+const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
+{
+    m_snapshotMutex.lock();
+    if (m_displaySnapshot.empty())
+    {
+        outSize = 0;
+        return nullptr;
+    }
+
+    outSize = static_cast<uint32_t>(m_displaySnapshot.size());
+    return m_displaySnapshot.data();
+}
+
+bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
+{
+    G508StateLock lock(m_stateMutex);
+    if (!m_hasPreferredDisplaySource)
+    {
+        outSource = {};
+        outDestFbp = 0u;
+        return false;
+    }
+
+    outSource = m_preferredDisplaySourceFrame;
+    outDestFbp = m_preferredDisplayDestFbp;
+    return true;
+}
+
+void GS::unlockDisplaySnapshot()
+{
+    m_snapshotMutex.unlock();
+}
+
+uint32_t GS::getLastDisplayBaseBytes() const
+{
+    return m_lastDisplayBaseBytes;
+}
+
+void GS::refreshDisplaySnapshot()
+{
+    snapshotVRAM();
+}
+
+bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     std::vector<uint8_t> &outPixels,
+                                     bool preserveAlpha,
+                                     bool useLocalMemoryLayout,
+                                     bool frameBaseIsPages,
+                                     uint32_t sourceOriginX,
+                                     uint32_t sourceOriginY) const
+{
+    if (!m_vram || m_vramSize == 0u)
+    {
+        return false;
+    }
+    G440LatchScope g440Copy(kG440SlotCopy);
+
+    static const bool s_g289PresentationAudit =
+        !envFlagEnabled("DC2_G289_NO_GPU_LOCAL_COPY") &&
+        (std::getenv("DC2_G289_GPU_LOCAL_COPY") == nullptr ||
+         envFlagEnabled("DC2_G289_GPU_LOCAL_COPY"));
+    if (s_g289PresentationAudit)
+        g289_prepare_presentation_read(
+            m_vram, frame.fbp, frame.fbw, frame.psm,
+            sourceOriginX, sourceOriginY, width, height,
+            useLocalMemoryLayout, frameBaseIsPages);
+
+    {
+        G440LatchScope g440Assign(kG440SlotAssign);
+        g440PrepareHostBuffer(outPixels, width, height);
+    }
+
+    const uint32_t baseBytes = frameBaseIsPages ? (frame.fbp * 8192u) : (frame.fbp * 256u);
+    const uint32_t basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
+    const uint32_t fbwBlocks = frame.fbw ? frame.fbw : (kHostFrameWidth / 64u);
+    const uint32_t bytesPerPixel = (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S) ? 2u : 4u;
+    const uint32_t strideBytes = fbwBlocks * 64u * bytesPerPixel;
+
+    if (frame.psm == GS_PSM_CT32 || frame.psm == GS_PSM_CT24)
+    {
+        const uint32_t srcPixelBytes = (frame.psm == GS_PSM_CT24) ? 3u : 4u;
+        if (useLocalMemoryLayout)
+        {
+            // G440: run-based PSMCT32 deswizzle. addrPSMCT32 factorises exactly into
+            //   page(y>>5, x>>6) + blockTable32[(y>>3)&3][(x>>3)&7] + columnTable32[y&7][x&7]*4,
+            // so within one output row the block base is constant across each aligned group of 8
+            // pixels and the 8 in-block word offsets are a fixed function of y&7. Those 8 offsets
+            // are four CONTIGUOUS word pairs (columnTable32 rows are {a,a+1,b,b+1,...}), so a
+            // group of 8 source pixels is four 8-byte loads instead of eight addrPSMCT32 calls
+            // and 32 byte copies. Bit-identical: same source bytes, same destination bytes.
+            // Rollback: DC2_G440_LEGACY_LATCH=1.
+            if (g440FastLatchEnabled() && width != 0u && height != 0u &&
+                ((sourceOriginX & 7u) == 0u) && ((width & 7u) == 0u))
+            {
+                // Conservative bound: the highest page this rectangle can touch must be fully
+                // resident. addrPSMCT32 never leaves the 8 KiB page it selects, so "last page
+                // fully inside VRAM" covers every read the loop makes, in any order.
+                const uint64_t lastPage =
+                    static_cast<uint64_t>(basePtr >> 5u) +
+                    static_cast<uint64_t>((sourceOriginY + height - 1u) >> 5u) *
+                        static_cast<uint64_t>(fbwBlocks ? fbwBlocks : 1u) +
+                    static_cast<uint64_t>((sourceOriginX + width - 1u) >> 6u);
+                // +2, not +1: blockId can reach 62, and its (blockId>>5)<<13 term spills one page.
+                if ((lastPage + 2ull) * 8192ull <= static_cast<uint64_t>(m_vramSize))
+                {
+                    const bool keepAlpha = preserveAlpha && frame.psm != GS_PSM_CT24;
+                    for (uint32_t y = 0; y < height; ++y)
+                    {
+                        const uint32_t srcY = sourceOriginY + y;
+                        const uint8_t *const colRow = GSPSMCT32::columnTable32[srcY & 7u];
+                        // Four contiguous word-pair byte offsets inside the block.
+                        const uint32_t pairOff[4] = {
+                            static_cast<uint32_t>(colRow[0]) * 4u,
+                            static_cast<uint32_t>(colRow[2]) * 4u,
+                            static_cast<uint32_t>(colRow[4]) * 4u,
+                            static_cast<uint32_t>(colRow[6]) * 4u};
+                        uint32_t *dstRow = reinterpret_cast<uint32_t *>(
+                            outPixels.data() + (static_cast<size_t>(y) * kHostFrameWidth * 4u));
+                        for (uint32_t x = 0; x < width; x += 8u)
+                        {
+                            const uint32_t srcX = sourceOriginX + x;
+                            const uint32_t blockBase =
+                                GSPSMCT32::addrPSMCT32(basePtr, fbwBlocks, srcX, srcY) - pairOff[0];
+                            uint32_t *dst = dstRow + x;
+                            for (int p = 0; p < 4; ++p)
+                            {
+                                uint32_t two[2];
+                                std::memcpy(two, m_vram + blockBase + pairOff[p], 8u);
+                                if (keepAlpha)
+                                {
+                                    dst[p * 2 + 0] = two[0];
+                                    dst[p * 2 + 1] = two[1];
+                                }
+                                else
+                                {
+                                    dst[p * 2 + 0] = two[0] | 0xFF000000u;
+                                    dst[p * 2 + 1] = two[1] | 0xFF000000u;
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                uint8_t *dstRow = outPixels.data() + (y * kHostFrameWidth * 4u);
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    const uint32_t srcX = sourceOriginX + x;
+                    const uint32_t srcY = sourceOriginY + y;
+                    const uint32_t srcOff = GSPSMCT32::addrPSMCT32(basePtr, fbwBlocks, srcX, srcY);
+                    if (srcOff + srcPixelBytes > m_vramSize)
+                    {
+                        return false;
+                    }
+
+                    dstRow[x * 4u + 0u] = m_vram[srcOff + 0u];
+                    dstRow[x * 4u + 1u] = m_vram[srcOff + 1u];
+                    dstRow[x * 4u + 2u] = m_vram[srcOff + 2u];
+                    dstRow[x * 4u + 3u] =
+                        (preserveAlpha && frame.psm != GS_PSM_CT24) ? m_vram[srcOff + 3u] : 255u;
+                }
+            }
+            return true;
+        }
+
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            const uint32_t dstOff = y * kHostFrameWidth * 4u;
+            uint8_t *dstRow = outPixels.data() + dstOff;
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const uint32_t srcX = sourceOriginX + x;
+                const uint32_t srcY = sourceOriginY + y;
+                const uint32_t srcOff = baseBytes + (srcY * strideBytes) + (srcX * srcPixelBytes);
+                if (srcOff + srcPixelBytes > m_vramSize)
+                {
+                    return false;
+                }
+
+                dstRow[x * 4u + 0u] = m_vram[srcOff + 0u];
+                dstRow[x * 4u + 1u] = m_vram[srcOff + 1u];
+                dstRow[x * 4u + 2u] = m_vram[srcOff + 2u];
+                dstRow[x * 4u + 3u] =
+                    (preserveAlpha && frame.psm != GS_PSM_CT24) ? m_vram[srcOff + 3u] : 255u;
+            }
+        }
+        return true;
+    }
+
+    if (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S)
+    {
+        if (useLocalMemoryLayout)
+        {
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                const uint32_t dstOff = y * kHostFrameWidth * 4u;
+                uint8_t *dst = outPixels.data() + dstOff;
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    const uint32_t srcX = sourceOriginX + x;
+                    const uint32_t srcY = sourceOriginY + y;
+                    const uint32_t srcOff = addrPSMCT16Family(basePtr, fbwBlocks, frame.psm, srcX, srcY);
+                    if (srcOff + sizeof(uint16_t) > m_vramSize)
+                    {
+                        return false;
+                    }
+
+                    uint16_t pixel = 0u;
+                    std::memcpy(&pixel, m_vram + srcOff, sizeof(pixel));
+                    const uint32_t r = pixel & 31u;
+                    const uint32_t g = (pixel >> 5) & 31u;
+                    const uint32_t b = (pixel >> 10) & 31u;
+                    dst[x * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
+                    dst[x * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
+                    dst[x * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                    dst[x * 4u + 3u] = preserveAlpha ? ((pixel & 0x8000u) ? 0x80u : 0x00u) : 255u;
+                }
+            }
+            return true;
+        }
+
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            const uint32_t dstOff = y * kHostFrameWidth * 4u;
+            uint8_t *dst = outPixels.data() + dstOff;
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const uint32_t srcX = sourceOriginX + x;
+                const uint32_t srcY = sourceOriginY + y;
+                const uint32_t srcOff = baseBytes + (srcY * strideBytes) + (srcX * 2u);
+                if (srcOff + sizeof(uint16_t) > m_vramSize)
+                {
+                    return false;
+                }
+
+                uint16_t pixel = 0u;
+                std::memcpy(&pixel, m_vram + srcOff, sizeof(pixel));
+                const uint32_t r = pixel & 31u;
+                const uint32_t g = (pixel >> 5) & 31u;
+                const uint32_t b = (pixel >> 10) & 31u;
+                dst[x * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
+                dst[x * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
+                dst[x * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                dst[x * 4u + 3u] = preserveAlpha ? ((pixel & 0x8000u) ? 0x80u : 0x00u) : 255u;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// G412: privileged PCRTC registers and the field phase are written on the EE thread, outside
+// the MTGS FIFO. A depth-two pipeline therefore carries an immutable boundary copy into the
+// worker's presentation latch. VRAM and draw/context state remain worker-owned and FIFO-ordered.
+namespace
+{
+    struct G412PresentationOverride
+    {
+        GSRegisters regs{};
+        uint64_t vsyncTick = 0ull;
+        bool active = false;
+    };
+
+    thread_local G412PresentationOverride s_g412PresentationOverride{};
+
+    // G677: MenuLoop renders through the guest's logical VRAM path, not the native raster
+    // backend. Its ordered boundary must therefore bypass any resident native FBO left by the
+    // preceding gameplay frame. This is source authority, not a resolution-specific menu hack.
+    thread_local bool s_g677LogicalPresentationAuthority = false;
+
+    struct G677LogicalPresentationScope
+    {
+        bool previous = false;
+        G677LogicalPresentationScope()
+            : previous(s_g677LogicalPresentationAuthority)
+        {
+            s_g677LogicalPresentationAuthority = true;
+        }
+        ~G677LogicalPresentationScope()
+        {
+            s_g677LogicalPresentationAuthority = previous;
+        }
+    };
+}
+
+uint64_t g412_capture_vsync_tick()
+{
+    return ps2_syscalls::GetCurrentVSyncTick();
+}
+
+void g412_latch_host_presentation_snapshot(GS *gs,
+                                           uint64_t pmode,
+                                           uint64_t smode2,
+                                           uint64_t dispfb1,
+                                           uint64_t display1,
+                                           uint64_t dispfb2,
+                                           uint64_t display2,
+                                           uint64_t bgcolor,
+                                           uint64_t vsyncTick)
+{
+    if (!gs)
+        return;
+
+    const G412PresentationOverride previous = s_g412PresentationOverride;
+    s_g412PresentationOverride = {};
+    s_g412PresentationOverride.regs.pmode = pmode;
+    s_g412PresentationOverride.regs.smode2 = smode2;
+    s_g412PresentationOverride.regs.dispfb1 = dispfb1;
+    s_g412PresentationOverride.regs.display1 = display1;
+    s_g412PresentationOverride.regs.dispfb2 = dispfb2;
+    s_g412PresentationOverride.regs.display2 = display2;
+    s_g412PresentationOverride.regs.bgcolor = bgcolor;
+    s_g412PresentationOverride.vsyncTick = vsyncTick;
+    s_g412PresentationOverride.active = true;
+
+    struct Restore
+    {
+        G412PresentationOverride previous;
+        ~Restore() { s_g412PresentationOverride = previous; }
+    } restore{previous};
+    (void)restore;
+    gs->latchHostPresentationFrame();
+}
+
+void g677_latch_logical_host_presentation_frame(GS *gs)
+{
+    if (!gs)
+        return;
+    G677LogicalPresentationScope logicalAuthority;
+    (void)logicalAuthority;
+    gs->latchHostPresentationFrame();
+}
+
+void g677_latch_logical_host_presentation_snapshot(GS *gs,
+                                                    uint64_t pmode,
+                                                    uint64_t smode2,
+                                                    uint64_t dispfb1,
+                                                    uint64_t display1,
+                                                    uint64_t dispfb2,
+                                                    uint64_t display2,
+                                                    uint64_t bgcolor,
+                                                    uint64_t vsyncTick)
+{
+    if (!gs)
+        return;
+    G677LogicalPresentationScope logicalAuthority;
+    (void)logicalAuthority;
+    g412_latch_host_presentation_snapshot(gs,
+                                          pmode,
+                                          smode2,
+                                          dispfb1,
+                                          display1,
+                                          dispfb2,
+                                          display2,
+                                          bgcolor,
+                                          vsyncTick);
+}
+
+// ===== G599: WHOLE-VRAM PAGE MAP AT THE PRESENTATION LATCH (default OFF) =====
+// Every visible pixel is in m_vram at this instant — copyFrameToHostRgbaUnlocked is a VRAM
+// deswizzle read — so hashing ALL pages here and diffing two arms names a visual defect's pages
+// with no hypothesis at all. G599 needed this after refuting two specific write hypotheses one at
+// a time (the 0x139 publication's whole guest-VRAM write, and the VRAM→FBO upload skip), each of
+// which cost a build cycle to test.
+//
+// Called at the TOP of the latch, before any presentation path branches: the dual-CRT and
+// Crt1Only/Crt2Only modes all `return` early, so a hook placed at the single-CRT copy fires on no
+// frame at all on this route.
+//
+// Keyed on the SCRIPT clock (`g_dc2ScriptFrame`), so the key names the same script instant in every
+// arm at any frame rate and matches the `-SfDump` PPM of the same key by construction (G598 §1).
+//   DC2_G599_VRAMMAP=<every>   emit once per <every>-scriptFrame bucket
+//   DC2_G599_SF_LO / _SF_HI    window (shared with the rasterizer-side G599 census)
+static void g599VramMap(const uint8_t *vram, uint32_t vramSize)
+{
+    static const uint32_t s_every = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_VRAMMAP");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    if (s_every == 0u || vram == nullptr || vramSize < 8192u)
+        return;
+    static const uint32_t s_lo = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_SF_LO");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    static const uint32_t s_hi = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_SF_HI");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+    if (sf < s_lo || (s_hi != 0u && sf > s_hi))
+        return;
+    static uint32_t s_lastBucket = 0xFFFFFFFFu;
+    const uint32_t bucket = sf / s_every;
+    if (bucket == s_lastBucket)
+        return;
+    s_lastBucket = bucket;
+    const uint32_t key = bucket * s_every;
+    // DC2_G599_SURF="139,68,0" — also decode each named surface straight out of guest VRAM as
+    // PSMCT32 512x416 and write it as a PPM named for the SAME key as the -SfDump frame. G399's
+    // probe does the same decode but keys on the latch counter and forces the raw-VRAM diag path;
+    // this one keys on the script clock and changes nothing, so the two arms' surfaces line up with
+    // each other and with their presented frames.
+    static const std::vector<uint32_t> s_surf = []() {
+        std::vector<uint32_t> out;
+        const char *e = std::getenv("DC2_G599_SURF");
+        for (const char *p = e ? e : ""; *p;)
+        {
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(p, &end, 16);
+            if (end == p)
+                break;
+            out.push_back(static_cast<uint32_t>(v));
+            p = end;
+            while (*p == ',' || *p == ' ')
+                ++p;
+        }
+        return out;
+    }();
+    if (!s_surf.empty())
+    {
+        constexpr uint32_t kW = 512u, kH = 416u, kFbwPages = 8u;
+        const char *tag = std::getenv("DC2_FRAME_DUMP_TAG");
+        std::vector<uint8_t> rgb(static_cast<size_t>(kW) * kH * 3u);
+        for (const uint32_t fbp : s_surf)
+        {
+            const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+            for (uint32_t y = 0u; y < kH; ++y)
+                for (uint32_t x = 0u; x < kW; ++x)
+                {
+                    const uint32_t off = GSPSMCT32::addrPSMCT32(base, kFbwPages, x, y);
+                    uint32_t px = 0u;
+                    if (off + 4u <= vramSize)
+                        std::memcpy(&px, vram + off, 4u);
+                    const size_t o = (static_cast<size_t>(y) * kW + x) * 3u;
+                    rgb[o + 0u] = static_cast<uint8_t>(px & 0xFFu);
+                    rgb[o + 1u] = static_cast<uint8_t>((px >> 8) & 0xFFu);
+                    rgb[o + 2u] = static_cast<uint8_t>((px >> 16) & 0xFFu);
+                }
+            char path[192];
+            std::filesystem::create_directories("captures");
+            std::snprintf(path, sizeof(path), "captures/g599surf_%s_%03x_%06u.ppm",
+                          tag ? tag : "run", fbp, key);
+            if (FILE *fp = std::fopen(path, "wb"))
+            {
+                std::fprintf(fp, "P6\n%u %u\n255\n", kW, kH);
+                std::fwrite(rgb.data(), 1u, rgb.size(), fp);
+                std::fclose(fp);
+            }
+        }
+    }
+    const uint32_t pages = vramSize / 8192u;
+    std::fprintf(stderr, "[G599:vram] key=%u sf=%u pages=%u\n", key, sf, pages);
+    char line[32 * 9 + 8];
+    for (uint32_t p0 = 0; p0 < pages; p0 += 32u)
+    {
+        int o = 0;
+        line[0] = '\0';
+        for (uint32_t p = p0; p < p0 + 32u && p < pages; ++p)
+        {
+            uint64_t h = 1469598103934665603ull; // FNV-1a, fingerprint only
+            const uint8_t *b = vram + static_cast<size_t>(p) * 8192u;
+            for (uint32_t k = 0; k < 8192u; ++k)
+                h = (h ^ b[k]) * 1099511628211ull;
+            o += std::snprintf(line + o, sizeof(line) - o, "%08x ",
+                               static_cast<uint32_t>(h >> 32));
+        }
+        std::fprintf(stderr, "[G599:vrampg] key=%u p=%03x %s\n", bucket * s_every, p0, line);
+    }
+}
+
+void GS::latchHostPresentationFrame()
+{
+    // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
+    std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    g599VramMap(m_vram, m_vramSize); // G599 diagnostic, default OFF
+    // G440 (diagnostic, DC2_G440_LATCH=1): this whole function is the frame-boundary closure the
+    // GS worker runs after every window of the frame — measured at 5.4-5.8 ms/f, i.e. the entire
+    // "serial residue" G439 could not attribute. Declared BEFORE the total scope so the report
+    // (destroyed last) sees this call's contribution.
+    struct G440Rep
+    {
+        const char *path = "none";
+        uint32_t w = 0u, h = 0u;
+        ~G440Rep() { g440LatchReport(path, w, h); }
+    } g440Rep;
+    G440LatchScope g440Total(kG440SlotTotal);
+    const GSRegisters *const presentationRegs =
+        s_g412PresentationOverride.active ? &s_g412PresentationOverride.regs : m_privRegs;
+    // Bump on EVERY exit path (success, dual-merge, clear-on-invalid) — any call can
+    // change the snapshot. Destructs before the lock_guard releases s_g189HostPresentMutex.
+    struct G176LatchBump
+    {
+        ~G176LatchBump()
+        {
+            s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
+            g176_notify_frame_latched();
+        }
+    } g176Bump;
+    (void)g176Bump;
+    static const bool s_g397PresentTrace = envFlagEnabled("DC2_G397_PRESENT_TRACE");
+
+    // PHASE F30: latch state probe, retained only for explicit phase tracing.
+    if (phaseDiagnosticsEnabled())
+    {
+        static std::atomic<uint32_t> s_f30Latch{0};
+        const uint32_t n = s_f30Latch.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= 6u || (n % 60u) == 0u)
+        {
+            const uint64_t dispfb1 = presentationRegs ? presentationRegs->dispfb1 : 0ull;
+            const uint64_t dispfb2 = presentationRegs ? presentationRegs->dispfb2 : 0ull;
+            const uint64_t pmode   = presentationRegs ? presentationRegs->pmode   : 0ull;
+            std::fprintf(stderr,
+                         "[F30:latch] n=%u pmode=0x%llx dispfb1=0x%llx dispfb2=0x%llx "
+                         "ctx0.frame.fbp=0x%x fbw=%u psm=%u "
+                         "ctx1.frame.fbp=0x%x fbw=%u psm=%u\n",
+                         n,
+                         static_cast<unsigned long long>(pmode),
+                         static_cast<unsigned long long>(dispfb1),
+                         static_cast<unsigned long long>(dispfb2),
+                         m_ctx[0].frame.fbp, m_ctx[0].frame.fbw, m_ctx[0].frame.psm,
+                         m_ctx[1].frame.fbp, m_ctx[1].frame.fbw, m_ctx[1].frame.psm);
+        }
+    }
+
+    if (!presentationRegs || !m_vram || m_vramSize == 0u)
+    {
+        if (s_g397PresentTrace)
+        {
+            static std::atomic<uint32_t> s_g397ResourceFailures{0u};
+            const uint32_t n = s_g397ResourceFailures.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 16u || (n % 120u) == 0u)
+            {
+                std::fprintf(stderr,
+                             "[G397:latch-fail] n=%u reason=resources priv=%u vram=%u size=%u\n",
+                             n,
+                             presentationRegs ? 1u : 0u,
+                             m_vram ? 1u : 0u,
+                             m_vramSize);
+            }
+        }
+        m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = 0u;
+        m_hostPresentationHeight = 0u;
+        m_hostPresentationDisplayFbp = 0u;
+        m_hostPresentationSourceFbp = 0u;
+        m_hostPresentationUsedPreferred = false;
+        m_hasHostPresentationFrame = false;
+        return;
+    }
+
+    const GSPmodeState pmode = decodePmode(presentationRegs->pmode);
+    const GSSmode2State smode2 = decodeSMode2(presentationRegs->smode2);
+    // G353: interlaced FIELD output. By default weave it into a whole-frame present (no
+    // per-field bob) to remove the one-line-per-frame screen shake; DC2_G353_FIELD_BOB=1
+    // restores the legacy bob. See g353FieldBobEnabled() for the full rationale.
+    const bool interlacedField = smode2.interlaced && !smode2.frameMode;
+    const bool applyFieldMode = interlacedField && g353FieldBobEnabled();
+    const uint64_t presentationVsyncTick = s_g412PresentationOverride.active
+                                               ? s_g412PresentationOverride.vsyncTick
+                                               : ps2_syscalls::GetCurrentVSyncTick();
+    const bool oddField = (presentationVsyncTick & 1ull) != 0ull;
+    const GSFrameReg displayFrame1 = decodeDisplayFrame(presentationRegs->dispfb1);
+    const GSFrameReg displayFrame2 = decodeDisplayFrame(presentationRegs->dispfb2);
+    const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(presentationRegs->dispfb1);
+    const GSDisplayReadOrigin displayOrigin2 = decodeDisplayReadOrigin(presentationRegs->dispfb2);
+
+    // G353 evidence trace (video-mode facts + per-field DBY, to confirm the bob is the sole
+    // shake source and DBY is not alternating). Quiet unless DC2_PHASE_TRACE=1.
+    if (phaseDiagnosticsEnabled())
+    {
+        static std::atomic<uint32_t> s_g353Field{0};
+        const uint32_t n = s_g353Field.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= 8u || (n % 120u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G353:field] n=%u smode2=0x%llx int=%u ffmd=%u interlacedField=%u "
+                         "bob=%u odd=%u dbY1=%u dbY2=%u\n",
+                         n,
+                         static_cast<unsigned long long>(presentationRegs->smode2),
+                         smode2.interlaced ? 1u : 0u,
+                         smode2.frameMode ? 1u : 0u,
+                         interlacedField ? 1u : 0u,
+                         applyFieldMode ? 1u : 0u,
+                         oddField ? 1u : 0u,
+                         displayOrigin1.y,
+                         displayOrigin2.y);
+        }
+    }
+
+    // G365 (diagnostic, default-off): dump the scene RTT (fbp 0x139 = tbp 0x2720) and the
+    // display buffer as raw CT32 PPMs at latch time, so the MAP-160 right-edge line can be
+    // located in VRAM (RTT vs display) instead of only in the presented frame.
+    {
+        static const bool s_g365rtt = (std::getenv("DC2_G365_RTTDUMP") != nullptr);
+        if (s_g365rtt && m_vram)
+        {
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n == 600u || n == 900u)
+            {
+                const struct { const char *tag; uint32_t fbp; } targets[2] = {
+                    { "rtt", 0x139u }, { "disp", 0x68u } };
+                for (const auto &t : targets)
+                {
+                    char path[128];
+                    std::snprintf(path, sizeof(path), "captures/g365_%s_%u.ppm", t.tag, n);
+                    FILE *fp = std::fopen(path, "wb");
+                    if (!fp) continue;
+                    std::fprintf(fp, "P6\n512 416\n255\n");
+                    const uint32_t base = GSInternal::framePageBaseToBlock(t.fbp);
+                    for (uint32_t yy = 0; yy < 416u; ++yy)
+                        for (uint32_t xx = 0; xx < 512u; ++xx)
+                        {
+                            const uint32_t off = GSPSMCT32::addrPSMCT32(base, 8u, xx, yy);
+                            uint32_t px = 0u;
+                            if (off + 4u <= m_vramSize) std::memcpy(&px, m_vram + off, 4);
+                            const uint8_t rgb[3] = { (uint8_t)(px & 0xFFu),
+                                                     (uint8_t)((px >> 8) & 0xFFu),
+                                                     (uint8_t)((px >> 16) & 0xFFu) };
+                            std::fwrite(rgb, 1, 3, fp);
+                        }
+                    std::fclose(fp);
+                    std::fprintf(stderr, "[G365:vram] wrote %s\n", path);
+                }
+            }
+        }
+    }
+
+    // G399 (diagnostic, default-off): report/dump the raw PSMCT32 contents of the dungeon
+    // render-target chain (0x139 scene RTT -> 0x068/0x000 post-process + composite) so the
+    // Dungeon 6 darkening can be attributed to the draw path INTO 0x139 versus the
+    // 0x139 -> 0x2720 readback/composite that consumes it.
+    g399ProbeSurfaces(m_vram, m_vramSize);
+
+    uint32_t width1 = 0u;
+    uint32_t height1 = 0u;
+    uint32_t width2 = 0u;
+    uint32_t height2 = 0u;
+    decodeDisplaySize(presentationRegs->display1, width1, height1);
+    decodeDisplaySize(presentationRegs->display2, width2, height2);
+
+    static uint32_t s_dispRegLogCount = 0u;
+    if (s_dispRegLogCount++ < 5u)
+    {
+        std::fprintf(stderr, "\n========== [DC2 GS DISPLAY/DISPFB REGISTERS] ==========\n");
+        std::fprintf(stderr, "pmode=0x%llx smode2=0x%llx\n",
+                     static_cast<unsigned long long>(presentationRegs->pmode),
+                     static_cast<unsigned long long>(presentationRegs->smode2));
+        std::fprintf(stderr, "display1=0x%llx -> decoded width=%u, height=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->display1), width1, height1);
+        std::fprintf(stderr, "dispfb1=0x%llx -> fbp=0x%x, fbw=%u, psm=0x%x, dbx=%u, dby=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->dispfb1),
+                     displayFrame1.fbp, displayFrame1.fbw, static_cast<uint32_t>(displayFrame1.psm),
+                     displayOrigin1.x, displayOrigin1.y);
+        std::fprintf(stderr, "display2=0x%llx -> decoded width=%u, height=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->display2), width2, height2);
+        std::fprintf(stderr, "dispfb2=0x%llx -> fbp=0x%x, fbw=%u, psm=0x%x, dbx=%u, dby=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->dispfb2),
+                     displayFrame2.fbp, displayFrame2.fbw, static_cast<uint32_t>(displayFrame2.psm),
+                     displayOrigin2.x, displayOrigin2.y);
+        std::fprintf(stderr, "========================================================\n\n");
+        std::fflush(stderr);
+    }
+
+    const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(presentationRegs->display1, displayFrame1);
+    const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(presentationRegs->display2, displayFrame2);
+    auto g397TraceFailure = [&](const char *reason)
+    {
+        if (!s_g397PresentTrace)
+            return;
+        static std::atomic<uint32_t> s_g397Failures{0u};
+        const uint32_t n = s_g397Failures.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n > 16u && (n % 120u) != 0u)
+            return;
+        std::fprintf(stderr,
+                     "[G397:latch-fail] n=%u reason=%s valid1=%u valid2=%u "
+                     "pmode=0x%llx smode2=0x%llx dispfb1=0x%llx display1=0x%llx "
+                     "dispfb2=0x%llx display2=0x%llx "
+                     "ctx0(fbp=0x%x fbw=%u psm=0x%x) ctx1(fbp=0x%x fbw=%u psm=0x%x)\n",
+                     n,
+                     reason,
+                     validCrt1 ? 1u : 0u,
+                     validCrt2 ? 1u : 0u,
+                     static_cast<unsigned long long>(presentationRegs->pmode),
+                     static_cast<unsigned long long>(presentationRegs->smode2),
+                     static_cast<unsigned long long>(presentationRegs->dispfb1),
+                     static_cast<unsigned long long>(presentationRegs->display1),
+                     static_cast<unsigned long long>(presentationRegs->dispfb2),
+                     static_cast<unsigned long long>(presentationRegs->display2),
+                     m_ctx[0].frame.fbp,
+                     m_ctx[0].frame.fbw,
+                     static_cast<uint32_t>(m_ctx[0].frame.psm),
+                     m_ctx[1].frame.fbp,
+                     m_ctx[1].frame.fbw,
+                     static_cast<uint32_t>(m_ctx[1].frame.psm));
+    };
+
+    // G356: per-present timeline of BOTH display double-buffers' circle-region VRAM content
+    // (block 0x0 and block 0xd00), + which fbp is displayed. Pins exactly when block-0's field
+    // is destroyed relative to the MenuCapture grab (Sindain inventory circle diagnosis).
+    static const bool s_g356Tl = (std::getenv("DC2_G356_TL") != nullptr);
+    if (s_g356Tl && m_vram && m_vramSize)
+    {
+        auto circ = [&](uint32_t blk) -> std::pair<double,double> {
+            uint64_t sumG = 0, accG = 0; int prev = -1; uint32_t c = 0;
+            for (int x = 300; x <= 380; ++x) {
+                const uint32_t o = GSPSMCT32::addrPSMCT32(blk, 8u, (uint32_t)x, 200u);
+                uint32_t px = 0; if (o + 4u <= m_vramSize) std::memcpy(&px, m_vram + o, 4);
+                const int g = (int)((px >> 8) & 0xFFu); sumG += (uint32_t)g;
+                if (prev >= 0) accG += (uint32_t)std::abs(g - prev); prev = g; ++c;
+            }
+            return { c ? (double)sumG/c : 0.0, c>1 ? (double)accG/(c-1) : 0.0 };
+        };
+        auto b0 = circ(0x0u); auto bd = circ(0xd00u);
+        static std::atomic<uint32_t> s_tl{0};
+        const uint32_t n = s_tl.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        std::fprintf(stderr,
+            "[G356:tl] n=%u dispFbp1=0x%x dispFbp2=0x%x blk0(G=%.0f D=%.1f) blkD00(G=%.0f D=%.1f)\n",
+            n, displayFrame1.fbp, displayFrame2.fbp, b0.first, b0.second, bd.first, bd.second);
+    }
+
+    uint32_t f50_12_latch_n = 0u;
+    if (f50_12_trace_enabled())
+    {
+        static std::atomic<uint32_t> s_f50_12_latch{0};
+        f50_12_latch_n = s_f50_12_latch.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (f50_12_latch_should_log(f50_12_latch_n))
+        {
+            std::fprintf(stderr,
+                         "[F512:latch] n=%u valid1=%u valid2=%u pmode=0x%llx smode2=0x%llx "
+                         "disp1(fbp=0x%x fbw=%u psm=0x%x org=%u,%u size=%ux%u) "
+                         "disp2(fbp=0x%x fbw=%u psm=0x%x org=%u,%u size=%ux%u) "
+                         "ctx0(fbp=0x%x fbw=%u psm=0x%x) ctx1(fbp=0x%x fbw=%u psm=0x%x) "
+                         "preferred=%u prefSrc(fbp=0x%x fbw=%u psm=0x%x) prefDst=0x%x\n",
+                         f50_12_latch_n,
+                         validCrt1 ? 1u : 0u,
+                         validCrt2 ? 1u : 0u,
+                         static_cast<unsigned long long>(presentationRegs->pmode),
+                         static_cast<unsigned long long>(presentationRegs->smode2),
+                         displayFrame1.fbp, displayFrame1.fbw, static_cast<uint32_t>(displayFrame1.psm),
+                         displayOrigin1.x, displayOrigin1.y, width1, height1,
+                         displayFrame2.fbp, displayFrame2.fbw, static_cast<uint32_t>(displayFrame2.psm),
+                         displayOrigin2.x, displayOrigin2.y, width2, height2,
+                         m_ctx[0].frame.fbp, m_ctx[0].frame.fbw, static_cast<uint32_t>(m_ctx[0].frame.psm),
+                         m_ctx[1].frame.fbp, m_ctx[1].frame.fbw, static_cast<uint32_t>(m_ctx[1].frame.psm),
+                         m_hasPreferredDisplaySource ? 1u : 0u,
+                         m_preferredDisplaySourceFrame.fbp,
+                         m_preferredDisplaySourceFrame.fbw,
+                         static_cast<uint32_t>(m_preferredDisplaySourceFrame.psm),
+                         m_preferredDisplayDestFbp);
+        }
+    }
+
+    auto copyDisplaySource = [&](const GSFrameReg &displayFrame,
+                                 const GSDisplayReadOrigin &displayOrigin,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 bool allowPreferred,
+                                 bool preserveAlpha,
+                                 GSFrameReg &selectedFrame,
+                                 std::vector<uint8_t> &scratch,
+                                 bool &usedPreferred) -> bool
+    {
+        selectedFrame = displayFrame;
+        scratch.clear();
+        usedPreferred = false;
+
+        if (allowPreferred &&
+            m_hasPreferredDisplaySource &&
+            m_preferredDisplayDestFbp == displayFrame.fbp &&
+            (m_preferredDisplaySourceFrame.fbw != 0u || m_preferredDisplaySourceFrame.fbp != displayFrame.fbp))
+        {
+            if (copyFrameToHostRgbaUnlocked(m_preferredDisplaySourceFrame,
+                                            width,
+                                            height,
+                                            scratch,
+                                            preserveAlpha,
+                                            true,
+                                            false,
+                                            0u,
+                                            0u))
+            {
+                selectedFrame = m_preferredDisplaySourceFrame;
+                usedPreferred = true;
+                if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+                {
+                    std::fprintf(stderr,
+                                 "[F512:latchcopy] n=%u stage=preferred displayFbp=0x%x sourceFbp=0x%x fbw=%u psm=0x%x size=%ux%u nonblack=%u\n",
+                                 f50_12_latch_n,
+                                 displayFrame.fbp,
+                                 selectedFrame.fbp,
+                                 selectedFrame.fbw,
+                                 static_cast<uint32_t>(selectedFrame.psm),
+                                 width,
+                                 height,
+                                 countNonBlackPixels(scratch, width, height));
+                }
+            }
+            else if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+            {
+                std::fprintf(stderr,
+                             "[F512:latchcopy] n=%u stage=preferred-fail displayFbp=0x%x sourceFbp=0x%x fbw=%u psm=0x%x size=%ux%u\n",
+                             f50_12_latch_n,
+                             displayFrame.fbp,
+                             m_preferredDisplaySourceFrame.fbp,
+                             m_preferredDisplaySourceFrame.fbw,
+                             static_cast<uint32_t>(m_preferredDisplaySourceFrame.psm),
+                             width,
+                             height);
+            }
+        }
+
+        if (scratch.empty())
+        {
+            if (!copyFrameToHostRgbaUnlocked(displayFrame,
+                                             width,
+                                             height,
+                                             scratch,
+                                             preserveAlpha,
+                                             true,
+                                             true,
+                                             displayOrigin.x,
+                                             displayOrigin.y))
+            {
+                if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+                {
+                    std::fprintf(stderr,
+                                 "[F512:latchcopy] n=%u stage=display-fail displayFbp=0x%x fbw=%u psm=0x%x org=%u,%u size=%ux%u\n",
+                                 f50_12_latch_n,
+                                 displayFrame.fbp,
+                                 displayFrame.fbw,
+                                 static_cast<uint32_t>(displayFrame.psm),
+                                 displayOrigin.x,
+                                 displayOrigin.y,
+                                 width,
+                                 height);
+                }
+                return false;
+            }
+            if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+            {
+                std::fprintf(stderr,
+                             "[F512:latchcopy] n=%u stage=display displayFbp=0x%x sourceFbp=0x%x fbw=%u psm=0x%x org=%u,%u size=%ux%u nonblack=%u\n",
+                             f50_12_latch_n,
+                             displayFrame.fbp,
+                             displayFrame.fbp,
+                             displayFrame.fbw,
+                             static_cast<uint32_t>(displayFrame.psm),
+                             displayOrigin.x,
+                             displayOrigin.y,
+                             width,
+                             height,
+                             countNonBlackPixels(scratch, width, height));
+            }
+        }
+
+        // G440: `== 0` test only — use the early-exit predicate, not the full-buffer count.
+        if (!usedPreferred && !hasNonBlackPixel(scratch, width, height))
+        {
+            for (int contextIndex = 0; contextIndex < 2; ++contextIndex)
+            {
+                // G368: this fallback presents a DRAWING context's FRAME register as the display
+                // image, but a display image's row stride is defined by DISPFB.FBW, never by
+                // whatever width the guest last happened to draw at. DC2 keeps context 1 at
+                // {fbp=0x0, fbw=10} (640 px) while both display buffers are fbw=8 (512 px), so
+                // whenever the primary read came back all-black this branch re-read a perfectly
+                // good 512-wide buffer at a 640-wide page stride: PSMCT32 pages are 64x32, so
+                // every 32-row page row slid +128 px sideways = the MAP-160 "character sliced
+                // into bands" tear. Read the candidate BUFFER, but at the DISPLAY's stride.
+                // Rollback (restores the raw context fbw): DC2_G368_NO_DISPFBW=1.
+                static const bool s_g368DispFbw = !envFlagEnabled("DC2_G368_NO_DISPFBW");
+                GSFrameReg candidate = m_ctx[contextIndex].frame;
+                if (s_g368DispFbw)
+                    candidate.fbw = displayFrame.fbw;
+                if (candidate.fbp == selectedFrame.fbp &&
+                    candidate.fbw == selectedFrame.fbw &&
+                    candidate.psm == selectedFrame.psm)
+                {
+                    continue;
+                }
+
+                std::vector<uint8_t> candidatePixels;
+                if (!copyFrameToHostRgbaUnlocked(candidate,
+                                                 width,
+                                                 height,
+                                                 candidatePixels,
+                                                 preserveAlpha,
+                                                 true,
+                                                 true,
+                                                 0u,
+                                                 0u))
+                {
+                    continue;
+                }
+
+                const uint32_t candidateNonBlack = countNonBlackPixels(candidatePixels, width, height);
+                if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+                {
+                    std::fprintf(stderr,
+                                 "[F512:latchcopy] n=%u stage=context%d displayFbp=0x%x sourceFbp=0x%x fbw=%u psm=0x%x size=%ux%u nonblack=%u\n",
+                                 f50_12_latch_n,
+                                 contextIndex,
+                                 displayFrame.fbp,
+                                 candidate.fbp,
+                                 candidate.fbw,
+                                 static_cast<uint32_t>(candidate.psm),
+                                 width,
+                                 height,
+                                 candidateNonBlack);
+                }
+
+                if (candidateNonBlack == 0u)
+                {
+                    continue;
+                }
+
+                selectedFrame = candidate;
+                scratch.swap(candidatePixels);
+                break;
+            }
+
+            if (uploadPresentationFallbackEnabled() &&
+                countNonBlackPixels(scratch, width, height) == 0u &&
+                s_f31UploadPresentationCandidate.valid)
+            {
+                const F31UploadPresentationCandidate &candidate = s_f31UploadPresentationCandidate;
+                const uint32_t candidateWidth = std::min<uint32_t>(width, candidate.width);
+                const uint32_t candidateHeight = std::min<uint32_t>(height, candidate.height);
+                if (candidateWidth != 0u &&
+                    candidateHeight != 0u &&
+                    !candidate.pixels.empty() &&
+                    countNonBlackPixels(candidate.pixels, candidateWidth, candidateHeight) != 0u)
+                {
+                    if (phaseDiagnosticsEnabled())
+                    {
+                        static std::atomic<uint32_t> s_f31UploadPresentCount{0};
+                        const uint32_t n = s_f31UploadPresentCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (n <= 12u || (n % 60u) == 0u)
+                        {
+                            std::fprintf(stderr,
+                                         "[F31:upload-present] n=%u displayFbp=0x%x srcDbp=0x%x dbw=%u psm=0x%x size=(%u,%u) nonzero=%u score=%llu\n",
+                                         n,
+                                         displayFrame.fbp,
+                                         candidate.frame.fbp,
+                                         candidate.frame.fbw,
+                                         static_cast<uint32_t>(candidate.frame.psm),
+                                         candidate.width,
+                                         candidate.height,
+                                         candidate.nonzeroBytes,
+                                         static_cast<unsigned long long>(candidate.score));
+                        }
+                    }
+                    selectedFrame = candidate.frame;
+                    scratch = candidate.pixels;
+                    usedPreferred = true;
+                }
+            }
+        }
+
+        // G368 (diagnostic, default-off: DC2_G368_TRACE=1). The MAP-160 band tear was measured to
+        // be the display buffer re-read at a 640-px (fbw=10) page stride instead of its own 512-px
+        // (fbw=8) one — a 32-row page-row shear of +128 px per band. Every substitution branch
+        // above can hand back a `selectedFrame` whose fbw/fbp is NOT the DISPFB one, so log the
+        // anomaly (and only the anomaly) to pin which branch fires on the torn ticks.
+        {
+            static const bool s_g368 = (std::getenv("DC2_G368_TRACE") != nullptr);
+            if (s_g368 && (selectedFrame.fbw != displayFrame.fbw ||
+                           selectedFrame.fbp != displayFrame.fbp))
+            {
+                static std::atomic<uint32_t> s_g368n{0};
+                const uint32_t n = s_g368n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                std::fprintf(stderr,
+                             "[G368:src] n=%u dispFbp=0x%x dispFbw=%u -> srcFbp=0x%x srcFbw=%u "
+                             "srcPsm=0x%x pref=%u size=%ux%u nonblack=%u ctx0(fbp=0x%x fbw=%u) "
+                             "ctx1(fbp=0x%x fbw=%u)\n",
+                             n, displayFrame.fbp, static_cast<uint32_t>(displayFrame.fbw),
+                             selectedFrame.fbp, static_cast<uint32_t>(selectedFrame.fbw),
+                             static_cast<uint32_t>(selectedFrame.psm), usedPreferred ? 1u : 0u,
+                             width, height, countNonBlackPixels(scratch, width, height),
+                             m_ctx[0].frame.fbp, static_cast<uint32_t>(m_ctx[0].frame.fbw),
+                             m_ctx[1].frame.fbp, static_cast<uint32_t>(m_ctx[1].frame.fbw));
+            }
+        }
+
+        return true;
+    };
+
+    if (!validCrt1 && !validCrt2)
+    {
+        g397TraceFailure("crt-invalid");
+        m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = 0u;
+        m_hostPresentationHeight = 0u;
+        m_hostPresentationDisplayFbp = 0u;
+        m_hostPresentationSourceFbp = 0u;
+        m_hostPresentationUsedPreferred = false;
+        m_hasHostPresentationFrame = false;
+        return;
+    }
+
+    if (!s_g677LogicalPresentationAuthority && dc2IsNativeHighResActive())
+    {
+        uint32_t nativeW = 0u, nativeH = 0u;
+        std::vector<uint8_t> nativeRgba;
+        const uint32_t targetFbp = validCrt1 ? displayFrame1.fbp : (validCrt2 ? displayFrame2.fbp : 0u);
+        const uint32_t fallbackFbp = (validCrt1 && validCrt2) ? displayFrame2.fbp : (m_preferredDisplaySourceFrame.fbp ? m_preferredDisplaySourceFrame.fbp : 0x139u);
+        // ⭐ G675: hand the backend the PCRTC READ RECTANGLE the 1x VRAM path uses — the DISPFB
+        // read origin and the DISPLAY DW/DH extent of whichever circuit is valid — so the
+        // high-res read publishes the SAME logical region, only at S x density. Without it the
+        // backend published the whole 512x512 render surface and the ~97 rows below the display
+        // rectangle were squashed into the presented image.
+        const GSDisplayReadOrigin &nativeOrigin = validCrt1 ? displayOrigin1 : displayOrigin2;
+        const int32_t nativeRectW = static_cast<int32_t>(validCrt1 ? width1 : width2);
+        const int32_t nativeRectH = static_cast<int32_t>(validCrt1 ? height1 : height2);
+        if (g675_backend_read_display_rect(targetFbp, fallbackFbp,
+                                           static_cast<int32_t>(nativeOrigin.x),
+                                           static_cast<int32_t>(nativeOrigin.y),
+                                           nativeRectW, nativeRectH,
+                                           nativeW, nativeH, nativeRgba) &&
+            !nativeRgba.empty() && nativeW > 0 && nativeH > 0)
+        {
+            normalizePresentationAlpha(nativeRgba, nativeW, nativeH);
+            m_hostPresentationFrame.swap(nativeRgba);
+            m_hostPresentationWidth = nativeW;
+            m_hostPresentationHeight = nativeH;
+            m_hostPresentationDisplayFbp = targetFbp;
+            m_hostPresentationSourceFbp = targetFbp;
+            m_hostPresentationUsedPreferred = false;
+            m_hasHostPresentationFrame = true;
+            return;
+        }
+    }
+
+    if (validCrt1 && validCrt2)
+    {
+        GSFrameReg selectedFrame1{};
+        GSFrameReg selectedFrame2{};
+        // G440: the latch ran once per frame and allocated ~2.6 MB of fresh 640x512 RGBA here
+        // every time (two display reads), so the assign(total, 0) that follows was paying page
+        // faults on cold pages, not a memset. Reusing one buffer per thread keeps the pages warm
+        // and lets g440PrepareHostBuffer clear only the margin. thread_local, not static: the
+        // present thread can also reach this function (runtime_host_display.inc).
+        static thread_local std::vector<uint8_t> rc1;
+        static thread_local std::vector<uint8_t> rc2;
+        bool usedPreferred1 = false;
+        bool usedPreferred2 = false;
+
+        const bool copiedCrt1 = copyDisplaySource(displayFrame1, displayOrigin1, width1, height1, false, true, selectedFrame1, rc1, usedPreferred1);
+        const bool copiedCrt2 = copyDisplaySource(displayFrame2, displayOrigin2, width2, height2, false, true, selectedFrame2, rc2, usedPreferred2);
+
+        if (copiedCrt1 && copiedCrt2)
+        {
+            const G195PresentMode g195Mode = g195PresentationMode();
+            if (g195Mode == G195PresentMode::Crt1Only || g195Mode == G195PresentMode::Crt2Only)
+            {
+                const bool useCrt1 = (g195Mode == G195PresentMode::Crt1Only);
+                std::vector<uint8_t> selected = useCrt1 ? rc1 : rc2;
+                const uint32_t width = useCrt1 ? width1 : width2;
+                const uint32_t height = useCrt1 ? height1 : height2;
+                if (applyFieldMode)
+                {
+                    applyFieldPresentation(selected, width, height, oddField);
+                }
+                normalizePresentationAlpha(selected, width, height);
+
+                m_hostPresentationFrame.swap(selected);
+                m_hostPresentationWidth = width;
+                m_hostPresentationHeight = height;
+                m_hostPresentationDisplayFbp = useCrt1 ? displayFrame1.fbp : displayFrame2.fbp;
+                m_hostPresentationSourceFbp = useCrt1 ? selectedFrame1.fbp : selectedFrame2.fbp;
+                m_hostPresentationUsedPreferred = false;
+                m_hasHostPresentationFrame = true;
+                static std::atomic<uint32_t> s_g195PresentLog{0};
+                const uint32_t pn = s_g195PresentLog.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (pn <= 16u || (pn % 60u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[G195:present] n=%u mode=%s applyField=%u odd=%u "
+                                 "dispFbp=0x%x sourceFbp=0x%x size=%ux%u nonblack=%u\n",
+                                 pn,
+                                 g195PresentationModeName(g195Mode),
+                                 applyFieldMode ? 1u : 0u,
+                                 oddField ? 1u : 0u,
+                                 m_hostPresentationDisplayFbp,
+                                 m_hostPresentationSourceFbp,
+                                 m_hostPresentationWidth,
+                                 m_hostPresentationHeight,
+                                 countNonBlackPixels(m_hostPresentationFrame,
+                                                     m_hostPresentationWidth,
+                                                     m_hostPresentationHeight));
+                }
+                return;
+            }
+
+            if (g195Mode == G195PresentMode::FieldPairCrt2Even ||
+                g195Mode == G195PresentMode::FieldPairCrt1Even)
+            {
+                const uint32_t width = std::max(width1, width2);
+                const uint32_t height = std::max(height1, height2);
+                const uint8_t bgR = static_cast<uint8_t>(presentationRegs->bgcolor & 0xFFu);
+                const uint8_t bgG = static_cast<uint8_t>((presentationRegs->bgcolor >> 8) & 0xFFu);
+                const uint8_t bgB = static_cast<uint8_t>((presentationRegs->bgcolor >> 16) & 0xFFu);
+
+                std::vector<uint8_t> merged(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+                for (uint32_t y = 0; y < height; ++y)
+                {
+                    const bool evenLine = (y & 1u) == 0u;
+                    const bool useCrt1 = (g195Mode == G195PresentMode::FieldPairCrt1Even)
+                                             ? evenLine
+                                             : !evenLine;
+                    const std::vector<uint8_t> &src = useCrt1 ? rc1 : rc2;
+                    const uint32_t srcWidth = useCrt1 ? width1 : width2;
+                    const uint32_t srcHeight = useCrt1 ? height1 : height2;
+                    uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                    for (uint32_t x = 0; x < width; ++x)
+                    {
+                        dstRow[x * 4u + 0u] = bgR;
+                        dstRow[x * 4u + 1u] = bgG;
+                        dstRow[x * 4u + 2u] = bgB;
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+
+                    if (srcWidth == 0u || srcHeight == 0u || src.empty())
+                    {
+                        continue;
+                    }
+
+                    uint32_t sourceY = (y >> 1u) << 1u;
+                    if (sourceY >= srcHeight)
+                    {
+                        sourceY = srcHeight - 1u;
+                    }
+
+                    const uint8_t *srcRow = src.data() + (sourceY * kHostFrameWidth * 4u);
+                    const uint32_t copyWidth = std::min(width, srcWidth);
+                    for (uint32_t x = 0; x < copyWidth; ++x)
+                    {
+                        dstRow[x * 4u + 0u] = srcRow[x * 4u + 0u];
+                        dstRow[x * 4u + 1u] = srcRow[x * 4u + 1u];
+                        dstRow[x * 4u + 2u] = srcRow[x * 4u + 2u];
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+                }
+
+                m_hostPresentationFrame.swap(merged);
+                m_hostPresentationWidth = width;
+                m_hostPresentationHeight = height;
+                m_hostPresentationDisplayFbp = displayFrame1.fbp;
+                m_hostPresentationSourceFbp = selectedFrame1.fbp;
+                m_hostPresentationUsedPreferred = false;
+                m_hasHostPresentationFrame = true;
+                static std::atomic<uint32_t> s_g195PresentLog{0};
+                const uint32_t pn = s_g195PresentLog.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (pn <= 16u || (pn % 60u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[G195:present] n=%u mode=%s applyField=%u odd=%u "
+                                 "disp1Org=%u,%u disp2Org=%u,%u size=%ux%u nonblack=%u\n",
+                                 pn,
+                                 g195PresentationModeName(g195Mode),
+                                 applyFieldMode ? 1u : 0u,
+                                 oddField ? 1u : 0u,
+                                 displayOrigin1.x,
+                                 displayOrigin1.y,
+                                 displayOrigin2.x,
+                                 displayOrigin2.y,
+                                 m_hostPresentationWidth,
+                                 m_hostPresentationHeight,
+                                 countNonBlackPixels(m_hostPresentationFrame,
+                                                     m_hostPresentationWidth,
+                                                     m_hostPresentationHeight));
+                }
+                return;
+            }
+
+            const uint32_t width = std::max(width1, width2);
+            const uint32_t height = std::max(height1, height2);
+            const uint8_t bgR = static_cast<uint8_t>(presentationRegs->bgcolor & 0xFFu);
+            const uint8_t bgG = static_cast<uint8_t>((presentationRegs->bgcolor >> 8) & 0xFFu);
+            const uint8_t bgB = static_cast<uint8_t>((presentationRegs->bgcolor >> 16) & 0xFFu);
+            const uint8_t bgA = pmode.alp;
+            g440Rep.path = "dual";
+            g440Rep.w = width;
+            g440Rep.h = height;
+            G440LatchScope g440Merge(kG440SlotMerge);
+
+            // G440: reused across latches (see rc1/rc2) — the old form allocated and zeroed a
+            // fresh 1.31 MB vector here every frame.
+            static thread_local std::vector<uint8_t> merged;
+            if (g440FastLatchEnabled())
+            {
+                // G440 fused dual-CRT merge. The legacy form made FOUR full passes over the
+                // 512x415 rectangle (background fill, CRT2 byte-copy, CRT1 blend, alpha=255) and
+                // touched 1.31 MB of freshly-allocated memory before any of them. This makes one
+                // pass per row and drops the alpha bookkeeping entirely: the legacy pass order
+                // ends with an unconditional alpha=255 over the whole [0,width)x[0,height)
+                // rectangle, so every alpha the earlier passes computed there was dead. Whatever
+                // is outside that rectangle stays zero, exactly as before. Bit-identical output.
+                g440PrepareHostBuffer(merged, width, height);
+                const uint32_t bgWord = static_cast<uint32_t>(bgR) |
+                                        (static_cast<uint32_t>(bgG) << 8) |
+                                        (static_cast<uint32_t>(bgB) << 16) |
+                                        0xFF000000u;
+                const bool useRc2 = !pmode.slbg;
+                const bool mmod = pmode.mmod;
+                const uint32_t alp = static_cast<uint32_t>(pmode.alp);
+                const bool g473Simd = g473SimdMergeArm() != 0;
+                const bool g473Verify = g473Simd && g473VerifyOn();
+                static thread_local std::vector<uint8_t> g473Reference;
+                if (g473Verify)
+                    g440PrepareHostBuffer(g473Reference, width, height);
+                // Three straight-line sub-loops per row, not one branchy one: the first two are
+                // trivially auto-vectorised (a masked 32-bit copy and a 32-bit fill), and folding
+                // them into the blend loop measured +0.24 ms/f because it destroyed that.
+                for (uint32_t y = 0; y < height; ++y)
+                {
+                    const size_t rowOff = static_cast<size_t>(y) * kHostFrameWidth * 4u;
+                    uint32_t *const dst = reinterpret_cast<uint32_t *>(merged.data() + rowOff);
+                    const uint32_t rc2W = (useRc2 && y < height2) ? width2 : 0u;
+                    if (rc2W != 0u)
+                    {
+                        const uint32_t *const src2 =
+                            reinterpret_cast<const uint32_t *>(rc2.data() + rowOff);
+                        for (uint32_t x = 0; x < rc2W; ++x)
+                            dst[x] = src2[x] | 0xFF000000u;
+                    }
+                    for (uint32_t x = rc2W; x < width; ++x)
+                        dst[x] = bgWord;
+
+                    uint32_t *g473RefRow = nullptr;
+                    if (g473Verify)
+                    {
+                        g473RefRow = reinterpret_cast<uint32_t *>(g473Reference.data() + rowOff);
+                        std::memcpy(g473RefRow, dst, static_cast<size_t>(width) * sizeof(uint32_t));
+                    }
+
+                    if (y < height1)
+                    {
+                        const uint32_t *const s1 =
+                            reinterpret_cast<const uint32_t *>(rc1.data() + rowOff);
+                        if (g473Simd)
+                            g473BlendPresentationRowSimd(s1, dst, width1, mmod, alp);
+                        else
+                            g473BlendPresentationRowScalar(s1, dst, width1, mmod, alp);
+                        if (g473Verify)
+                            g473BlendPresentationRowScalar(s1, g473RefRow, width1, mmod, alp);
+                    }
+                }
+                if (g473Verify)
+                {
+                    static uint64_t s_g473Frames = 0u, s_g473Bytes = 0u, s_g473Bad = 0u;
+                    ++s_g473Frames;
+                    const size_t bytes = static_cast<size_t>(kHostFrameWidth) *
+                                         kHostFrameHeight * 4u;
+                    s_g473Bytes += bytes;
+                    if (std::memcmp(merged.data(), g473Reference.data(), bytes) != 0)
+                    {
+                        for (size_t i = 0; i < bytes; ++i)
+                            if (merged[i] != g473Reference[i])
+                                ++s_g473Bad;
+                    }
+                    if (s_g473Bad != 0u || (s_g473Frames % 30u) == 0u)
+                        std::fprintf(stderr,
+                                     "[G473:verify] frames=%llu bytes=%llu bad=%llu\n",
+                                     static_cast<unsigned long long>(s_g473Frames),
+                                     static_cast<unsigned long long>(s_g473Bytes),
+                                     static_cast<unsigned long long>(s_g473Bad));
+                }
+            }
+            else
+            {
+            merged.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    dstRow[x * 4u + 0u] = bgR;
+                    dstRow[x * 4u + 1u] = bgG;
+                    dstRow[x * 4u + 2u] = bgB;
+                    dstRow[x * 4u + 3u] = bgA;
+                }
+            }
+
+            if (!pmode.slbg)
+            {
+                for (uint32_t y = 0; y < height2; ++y)
+                {
+                    const uint8_t *srcRow = rc2.data() + (y * kHostFrameWidth * 4u);
+                    uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                    for (uint32_t x = 0; x < width2; ++x)
+                    {
+                        dstRow[x * 4u + 0u] = srcRow[x * 4u + 0u];
+                        dstRow[x * 4u + 1u] = srcRow[x * 4u + 1u];
+                        dstRow[x * 4u + 2u] = srcRow[x * 4u + 2u];
+                        dstRow[x * 4u + 3u] = srcRow[x * 4u + 3u];
+                    }
+                }
+            }
+
+            for (uint32_t y = 0; y < height1; ++y)
+            {
+                const uint8_t *srcRow = rc1.data() + (y * kHostFrameWidth * 4u);
+                uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                for (uint32_t x = 0; x < width1; ++x)
+                {
+                    const uint8_t srcR = srcRow[x * 4u + 0u];
+                    const uint8_t srcG = srcRow[x * 4u + 1u];
+                    const uint8_t srcB = srcRow[x * 4u + 2u];
+                    const uint8_t srcA = srcRow[x * 4u + 3u];
+                    const uint8_t dstR = dstRow[x * 4u + 0u];
+                    const uint8_t dstG = dstRow[x * 4u + 1u];
+                    const uint8_t dstB = dstRow[x * 4u + 2u];
+                    const uint8_t dstA = dstRow[x * 4u + 3u];
+                    const uint32_t factor = pmode.mmod
+                                                ? static_cast<uint32_t>(pmode.alp)
+                                                : std::min<uint32_t>(255u, static_cast<uint32_t>(srcA) * 2u);
+
+                    dstRow[x * 4u + 0u] = blendPresentationChannel(srcR, dstR, factor);
+                    dstRow[x * 4u + 1u] = blendPresentationChannel(srcG, dstG, factor);
+                    dstRow[x * 4u + 2u] = blendPresentationChannel(srcB, dstB, factor);
+                    dstRow[x * 4u + 3u] = pmode.amod ? dstA : srcA;
+                }
+            }
+
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                uint8_t *row = merged.data() + (y * kHostFrameWidth * 4u);
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    row[x * 4u + 3u] = 255u;
+                }
+            }
+            }
+
+            if (applyFieldMode)
+            {
+                applyFieldPresentation(merged, width, height, oddField);
+            }
+
+            m_hostPresentationFrame.swap(merged);
+            m_hostPresentationWidth = width;
+            m_hostPresentationHeight = height;
+            m_hostPresentationDisplayFbp = displayFrame1.fbp;
+            m_hostPresentationSourceFbp = selectedFrame1.fbp;
+            m_hostPresentationUsedPreferred = false;
+            m_hasHostPresentationFrame = true;
+            if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+            {
+                std::fprintf(stderr,
+                             "[F512:latchdone] n=%u mode=dual displayFbp=0x%x sourceFbp=0x%x usedPreferred=0 size=%ux%u nonblack=%u\n",
+                             f50_12_latch_n,
+                             m_hostPresentationDisplayFbp,
+                             m_hostPresentationSourceFbp,
+                             m_hostPresentationWidth,
+                             m_hostPresentationHeight,
+                             countNonBlackPixels(m_hostPresentationFrame, m_hostPresentationWidth, m_hostPresentationHeight));
+            }
+            return;
+        }
+    }
+
+    const GSFrameReg &displayFrame = validCrt1 ? displayFrame1 : displayFrame2;
+    const uint32_t width = validCrt1 ? width1 : width2;
+    const uint32_t height = validCrt1 ? height1 : height2;
+
+    GSFrameReg selectedFrame = displayFrame;
+    static thread_local std::vector<uint8_t> scratch; // G440: reused, see rc1/rc2 above
+    bool usedPreferred = false;
+    g440Rep.path = "single";
+    g440Rep.w = width;
+    g440Rep.h = height;
+    const GSDisplayReadOrigin &displayOrigin = validCrt1 ? displayOrigin1 : displayOrigin2;
+    if (!copyDisplaySource(displayFrame, displayOrigin, width, height, true, false, selectedFrame, scratch, usedPreferred))
+    {
+        g397TraceFailure("copy-failed");
+        m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = 0u;
+        m_hostPresentationHeight = 0u;
+        m_hostPresentationDisplayFbp = displayFrame.fbp;
+        m_hostPresentationSourceFbp = 0u;
+        m_hostPresentationUsedPreferred = false;
+        m_hasHostPresentationFrame = false;
+        return;
+    }
+
+    if (applyFieldMode)
+    {
+        applyFieldPresentation(scratch, width, height, oddField);
+    }
+
+    normalizePresentationAlpha(scratch, width, height);
+
+    m_hostPresentationFrame.swap(scratch);
+    m_hostPresentationWidth = width;
+    m_hostPresentationHeight = height;
+    m_hostPresentationDisplayFbp = displayFrame.fbp;
+    m_hostPresentationSourceFbp = selectedFrame.fbp;
+    m_hostPresentationUsedPreferred = usedPreferred;
+    m_hasHostPresentationFrame = true;
+    if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
+    {
+        std::fprintf(stderr,
+                     "[F512:latchdone] n=%u mode=single displayFbp=0x%x sourceFbp=0x%x usedPreferred=%u size=%ux%u nonblack=%u\n",
+                     f50_12_latch_n,
+                     m_hostPresentationDisplayFbp,
+                     m_hostPresentationSourceFbp,
+                     m_hostPresentationUsedPreferred ? 1u : 0u,
+                     m_hostPresentationWidth,
+                     m_hostPresentationHeight,
+                     countNonBlackPixels(m_hostPresentationFrame, m_hostPresentationWidth, m_hostPresentationHeight));
+    }
+}
+
+bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+                                          uint32_t &outWidth,
+                                          uint32_t &outHeight,
+                                          uint32_t *outDisplayFbp,
+                                          uint32_t *outSourceFbp,
+                                          bool *outUsedPreferred) const
+{
+    // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
+    std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
+    {
+        outPixels.clear();
+        outWidth = 0u;
+        outHeight = 0u;
+        if (outDisplayFbp)
+            *outDisplayFbp = 0u;
+        if (outSourceFbp)
+            *outSourceFbp = 0u;
+        if (outUsedPreferred)
+            *outUsedPreferred = false;
+        return false;
+    }
+
+    outWidth = m_hostPresentationWidth;
+    outHeight = m_hostPresentationHeight;
+    if (outDisplayFbp)
+        *outDisplayFbp = m_hostPresentationDisplayFbp;
+    if (outSourceFbp)
+        *outSourceFbp = m_hostPresentationSourceFbp;
+    if (outUsedPreferred)
+        *outUsedPreferred = m_hostPresentationUsedPreferred;
+
+    const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
+    outPixels.assign(packedRowBytes * static_cast<size_t>(outHeight), 0u);
+    if (outWidth != 0u && outHeight != 0u)
+    {
+        const size_t sourceRowBytes = (m_hostPresentationWidth > 640u)
+                                          ? (static_cast<size_t>(m_hostPresentationWidth) * 4u)
+                                          : (static_cast<size_t>(kHostFrameWidth) * 4u);
+        for (uint32_t y = 0; y < outHeight; ++y)
+        {
+            const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
+            const size_t dstOffset = static_cast<size_t>(y) * packedRowBytes;
+            if (srcOffset + packedRowBytes > m_hostPresentationFrame.size() ||
+                dstOffset + packedRowBytes > outPixels.size())
+            {
+                outPixels.clear();
+                outWidth = 0u;
+                outHeight = 0u;
+                if (outDisplayFbp)
+                    *outDisplayFbp = 0u;
+                if (outSourceFbp)
+                    *outSourceFbp = 0u;
+                if (outUsedPreferred)
+                    *outUsedPreferred = false;
+                return false;
+            }
+
+            std::memcpy(outPixels.data() + dstOffset,
+                        m_hostPresentationFrame.data() + srcOffset,
+                        packedRowBytes);
+        }
+    }
+    return true;
+}

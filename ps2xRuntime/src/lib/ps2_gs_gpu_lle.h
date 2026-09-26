@@ -1,0 +1,147 @@
+// G178: bespoke LLE GPU rasterizer — PRIVATE interface between the batch front-end
+// (ps2_gs_rasterizer.cpp: entry validation, vertex translation, texture decode, VRAM swizzle
+// read/write) and the GL backend (ps2_gs_gpu_raster.cpp: persistent dedicated GPU thread, FBOs,
+// GPU-resident texture cache, draw submission, readback).
+//
+// This header is included ONLY by those two .cpp files (both in the ps2_runtime lib target); it
+// is deliberately NOT under include/runtime/ — nothing in the generated dc2_game target can see
+// it, so editing it never triggers the 30h full rebuild the public headers would.
+//
+// Everything here is opt-in behind DC2_G178_GPU=1 and default-off. See
+// plans/gpu-raster-arc-plan.md and plans/phase-G178-fix-log.md.
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+// One translated vertex. x/y are screen pixels (GS window coords minus XYOFFSET, pixel centers at
+// +0.5 like the CPU rasterizer); z is the raw GS Z value (uint bits, normalized on the GPU).
+// sq/tq/iq encode texture coords uniformly for both addressing modes (interpolated
+// `noperspective`, i.e. linearly in screen space — exactly the CPU rasterizer's convention):
+//   STQ (fst=0): sq = s/|q|, tq = t/|q|, iq = 1/|q|      → frag uv = (sq/iq, tq/iq)  [normalized]
+//   UV  (fst=1): sq = (u/16)/texW, tq = (v/16)/texH, iq = 1
+struct G178Vtx
+{
+    float x, y, z;
+    float sq, tq, iq;
+    uint8_t r, g, b, a;
+    // G364: GS per-vertex FOG byte (F). Interpolated by the FS and blended towards G178Draw::fogCol
+    // when the draw's fge flag is set. pad keeps the 4-byte attribute alignment explicit.
+    uint8_t fog, pad0, pad1, pad2;
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
+    // G561: flat per-triangle draw state for ordered same-texture runs. Values are integer-packed
+    // into floats below 2^24, hence lossless through the GL_FLOAT vertex attribute. The legacy
+    // shader ignores this private tail entirely. G684 excludes it from normal builds: all three
+    // consumers are closed default-off experiments, and carrying it inflated every upload by 50%.
+    float drawState0, drawState1, drawState2, drawState3;
+#endif
+};
+
+// One state-batched draw run over a contiguous vertex range (triangles, 3 verts each).
+struct G178Draw
+{
+    int firstVtx = 0;
+    int vtxCount = 0;
+    uint64_t texKey = 0; // 0 = untextured (vertex color only)
+    // G261: when nonzero, sample the persistent FBO color texture of this TARGET fbp instead of a
+    // texKey upload (GPU-resident RTT wave: the producer's pixels never round-tripped through
+    // VRAM). texKey must be 0; the front-end has already remapped UVs into the FBO's fbW x fbH
+    // bottom-first space. Must never equal the batch's own fbp (no feedback loops).
+    uint32_t srcFbp = 0;
+    uint8_t blend = 0;   // 0=off (Cv=Cs), 1=standard (Cs-Cd)*As+Cd, 2=additive Cs*As+Cd
+    uint8_t tfx = 0;     // GS TFX (0 modulate / 1 decal / 2 highlight / 3 highlight2)
+    uint8_t tcc = 0;
+    uint8_t fge = 0;     // G364: PRIM.FGE — blend RGB towards fogCol by the per-vertex F byte
+    uint32_t fogCol = 0; // G364: GS FOGCOL, 0x00BBGGRR (global state, snapshotted per draw)
+    uint8_t depthFunc = 0; // 0=disabled, 1=ALWAYS, 2=GEQUAL, 3=GREATER
+    bool depthWrite = false;
+    bool bilinear = false;
+    uint8_t wrapU = 0, wrapV = 0; // 0 repeat, 1 clamp-to-edge
+    // G406: per-sprite GS 12.4 UV rounding state. Zero flags disable the path.
+    uint16_t uvOriginX = 0, uvOriginY = 0;
+    uint8_t uvRoundU = 0, uvRoundV = 0;
+    // ⭐⭐⭐ G679: the EXACT-LATTICE PERIOD of each axis, in pixels. A sprite's texture coordinate is
+    // V(p) = v0 + (p - origin)·dt/dp, so it is an EXACT INTEGER precisely when (p - origin) is a
+    // multiple of |dp| / gcd(|dt|,|dp|) — that value. On those pixels the correct texel IS the
+    // boundary and `g406RoundAxis`'s down-nudge must not fire; the `pixel == origin` exception the
+    // rule already carried is just the p == origin case of this. 0 = "never exact" (a sprite whose
+    // v0 is not texel-aligned), 1 = every pixel (any 1:1 sprite). Packed into the round uniforms.
+    uint16_t uvPeriodU = 1, uvPeriodV = 1;
+    // ⭐ G675: 1 when this draw is a SCREEN-SPACE FST SPRITE — GS `PRIM_SPRITE` with TME and FST,
+    // i.e. an axis-aligned 1:1 texel→pixel blit whose UVs the front-end shifted by -0.5 texel per
+    // pixel so a 1x fragment centre lands on the CPU sampler's texel. The backend needs to know,
+    // for two reasons that only exist away from 1x / 4:3:
+    //   * at scale S the S sub-fragments of one logical pixel sit at logical x+0.25/x+0.75, so
+    //     that -0.5 shift puts one of them in the NEIGHBOURING atlas texel (measured: the two
+    //     sub-columns of the Items panel disagree by mean 17.68 / 63.5% of pixels). The sample
+    //     must be taken at the LOGICAL pixel centre — a 1:1 blit has no more source data, so
+    //     nearest magnification is the only faithful answer.
+    //   * under a widened field of view the 3D world is rendered wider, but screen-space 2D is
+    //     not projected at all, so it must be scaled about the screen centre to keep its shape.
+    // Zero for every triangle/strip/fan and for every non-FST sprite, so both effects are scoped
+    // to exactly the population that carries the 1x-calibrated UV shift.
+    uint8_t screenSprite = 0;
+    uint16_t scX0 = 0, scY0 = 0, scX1 = 0, scY1 = 0; // GS scissor (inclusive, top-origin)
+};
+
+// A texture the backend must (re)upload before drawing this batch (decoded RGBA8, linear,
+// row 0 = texel row 0). Replaces any previous texture with the same key.
+struct G178TexUpload
+{
+    uint64_t key = 0;
+    int w = 0, h = 0;
+    std::vector<uint32_t> px;
+};
+
+// One flush's worth of work. Submitted synchronously; on return `readback` holds the FBO color
+// contents (RGBA8, GL row order = BOTTOM row first — the front-end owns all row flipping).
+struct G178Batch
+{
+    uint32_t fbp = 0;
+    // G351 surface-key FBO override (0 = key by fbp). Routes ONLY the backend FBO selection —
+    // every fbp-gated semantic (g256 exact-depth family, RTT self-reference) stays on fbp.
+    uint32_t fboKey = 0;
+    int fbW = 0, fbH = 0;
+    bool clearDepth = false;
+    bool uploadFb = false;              // VRAM framebuffer copy is newer than the FBO
+    // G261 GPU-resident RTT wave flags:
+    bool skipReadback = false;          // leave the result in the FBO; `readback` stays empty
+    bool rttRawAlpha = false;           // apply the G255 raw-source-alpha RTT store without the env
+    std::vector<uint32_t> fbPixels;     // fbW*fbH RGBA when uploadFb (GL row order)
+    std::vector<uint32_t> g716SeedPages; // raw-authoritative pages overlay the guest seed on GPU
+    uint32_t g716SeedFbw = 0;
+    int g716SeedLo = 512, g716SeedHi = -1;
+    std::vector<uint32_t> g716SeedExpected, g716SeedEarlyPages; // non-mutating seed oracle
+    std::vector<G178TexUpload> texUploads;
+    std::vector<G178Vtx> verts;
+    std::vector<G178Draw> draws;
+    std::vector<uint32_t> readback;     // out (resized by the backend; empty under skipReadback)
+};
+
+// Backend (ps2_gs_gpu_raster.cpp). submit() blocks the calling thread until rendering+readback
+// are complete; returns false if the backend never started / failed (caller must CPU-fallback).
+bool g178_backend_ready();
+bool g178_backend_submit(G178Batch &batch);
+bool g178_backend_has_tex(uint64_t key); // still resident (not evicted)?
+// G261: synchronous row-window color readback from a target's persistent FBO (the deferred
+// materialization of a GPU-resident RTT wave at a real CPU-consumer edge). glY/rows are GL
+// (bottom-first) window coordinates; `out` is resized to width*rows, GL row order.
+bool g178_backend_read_color(uint32_t fbp, int width, int height, int glY, int rows,
+                             std::vector<uint32_t> &out);
+// G264: synchronous row-window color WRITE into a target's persistent FBO texture (upload-into-
+// FBO routing: the guest re-uploaded scratch content into resident rows, mirror it instead of
+// materializing). Same coordinate conventions as read_color; `in` must be width*rows RGBA8 in
+// GL (bottom-first) row order. The FBO must already exist with matching dimensions.
+bool g178_backend_write_color(uint32_t fbp, int width, int height, int glY, int rows,
+                              const std::vector<uint32_t> &in);
+// G280: synchronous GPU->GPU copy of CT32 page tiles between two persistent target FBO color
+// textures (physical-alias page view resolve: the same GS pages rendered under two FRAME/FBW
+// layouts hold identical within-page pixel order, so a page is a 64x32 rect in both views).
+// `rects6` packs 6 ints per rect: {srcX, srcGlY, dstX, dstGlY, w, h}, GL (bottom-first) window
+// coordinates in each FBO's own space. Both FBOs must already exist and every rect must lie
+// fully inside both; the copy is a bit-exact same-format glCopyTexSubImage2D, no readback.
+bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
+                                   const std::vector<int32_t> &rects6);
+// Native High-Res Presentation Read: read the active display FBO directly at its native physical resolution.
+bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+                                   std::vector<uint8_t> &outRgba);

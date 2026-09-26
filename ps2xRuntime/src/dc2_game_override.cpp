@@ -1,0 +1,707 @@
+// G570 probe: force-recompile marker for spike-only per-frame thread/backend attribution.
+// G434 probe: force-recompile marker for [G434:inv] kick workload invariant.
+// PHASE9: DC2 ג€” Game override: binds all 173 missing stub addresses to their handlers.
+// Without this file the recomp wrappers call TODO_NAMED() (returns -1) instead of the
+// actual stub, because the recompiler generated the wrappers before the stubs were added
+// to PS2_STUB_LIST.  bindAddressHandler() re-points each guest address at the right
+// ps2_stubs:: function at runtime, affecting only dc2.elf.
+
+#include "game_overrides.h"
+#include "ps2_runtime.h"
+
+// G189 & G440 diagnostics, defined in ps2_gif_arbiter.cpp / ps2_gs_gpu_raster.cpp.
+// Declared at top level global scope before any included headers.
+extern void g189_set_closure_stage(int stage, uint32_t n);
+extern int g189_worker_stage();
+extern uint64_t g189_worker_n();
+extern int g189_ee_stage();
+extern bool g440_latch_prof_on();
+extern void g440_note_flush_ns(uint64_t ns);
+#include "lib/ps2_runtime_parts/dc2_logger.inc"
+#include "lib/ps2_runtime_parts/dc2_crash_reporter.inc"
+// ⭐ G651: the G650/G651 core scheduler is DEFINED here. It needs <windows.h>, which this TU
+// already has through dc2_crash_reporter.inc, and — unlike ps2_gif_arbiter.cpp, where G650 put it —
+// this TU carries no GS-worker hot loop. See the note at the removal site for the measurement that
+// motivated the move (GS own +0.545/+0.820 from layout alone).
+// MSBuild does not reliably rebuild a .cpp when only an included .inc changed (the G359 trap), so
+// this marker must be touched whenever g650_thread_affinity.inc is edited.
+// g650_thread_affinity.inc revision: 3 (G651 adaptive topology + moved out of the GS worker's TU)
+#include "lib/ps2_runtime_parts/g650_thread_affinity.inc"
+#include "ps2_frame_dump.h"
+#include "ps2_mods.h"
+#include "ps2_lua.h"
+#include "ps2_input.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <chrono>
+#include <vector>
+#include <atomic>
+#include <functional>
+#include <string>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <unordered_map>
+#include "ps2_recompiled_functions.h"
+#include "dc2_coop_net.h"
+#include "dc2_coop_protocol_v5.h"
+#include "dc2_coop_v5_net.h"
+#include "dc2_chest_adapter.h"
+#include "dc2_world_snapshot_adapter.h"
+#include "dc2_dungeon_entry_intent.h"
+
+std::atomic<bool> g_dc2CoopInviteActive{false};
+std::atomic<uint16_t> g_dc2CoopInviteMap{0u};
+std::atomic<uint16_t> g_dc2CoopInviteFloor{0u};
+
+// P2 live pad state
+static bool     g_pad_live_connected_p2 = false;
+static uint16_t g_pad_live_mask_p2      = 0u;
+static uint8_t  g_pad_live_lx_p2        = 0x80u;
+static uint8_t  g_pad_live_ly_p2        = 0x80u;
+static uint8_t  g_pad_live_rx_p2        = 0x80u;
+static uint8_t  g_pad_live_ry_p2        = 0x80u;
+
+// Co-Op shared engine state
+static bool     g_coop_force_pad_port2  = false;
+static uint32_t g_coop_authority_tree   = 0u;
+// Advanced once per mgEndFrame on the hidden protocol-v5 authority. Pad reads
+// use it to consume at most one queued button transition per player per frame.
+static uint32_t g_coop_authority_frame_tick = 0u;
+// Snapshot-aligned tick for the authority frame currently being simulated.
+// It is zero during boot/entry, then becomes the next v5 snapshot tick. Both
+// native pad hooks sample against this value, making repeated reads idempotent.
+static uint32_t g_coop_authority_simulation_tick = 0u;
+static dc2::DungeonEntryIntent g_coop_dungeon_entry;
+static std::atomic<bool> g_dc2CoopNetworkReady{false};
+static std::atomic<int>  g_dc2CoopDesiredView{0};
+static std::atomic<int>  g_dc2CoopRenderedView{0};
+static std::atomic<uint32_t> g_dc2CoopRenderSequence{0u};
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// G182: EE thread CPU-time (user+kernel), same technique as G151/G156's worker-side
+// GetThreadTimes probe -- called from f29_mgendframe_probe, which runs ON the EE thread, so
+// GetCurrentThread() here is the EE thread itself. Lets us tell whether the measured VIF1(EE)
+// wall-time (G146:perf) is real CPU work or scheduler/cache stall, before chasing a dispatch-
+// overhead lever inside the interpreter.
+static uint64_t g182ThreadCpuNs()
+{
+    FILETIME cr, ex, kt, ut;
+    if (!GetThreadTimes(GetCurrentThread(), &cr, &ex, &kt, &ut))
+        return 0ull;
+    const uint64_t k = ((uint64_t)kt.dwHighDateTime << 32) | kt.dwLowDateTime;
+    const uint64_t u = ((uint64_t)ut.dwHighDateTime << 32) | ut.dwLowDateTime;
+    return (k + u) * 100ull; // FILETIME is 100 ns units -> ns
+}
+static uint32_t g182ThreadId() { return static_cast<uint32_t>(GetCurrentThreadId()); }
+#else
+static uint64_t g182ThreadCpuNs() { return 0ull; }
+static uint32_t g182ThreadId() { return 0u; }
+#endif
+#include "lib/ps2_critical_trace_api.inc"
+
+// G503: the FOURTH derivative probe's arm selector (g419_ab_instrument.inc, the rasterizer TU) and
+// the EE-thread instance of the G446 host PC sampler (g446_gsworker_pcsample.inc, the gif-arbiter
+// TU). Both are called from f29_mgendframe_probe below, which runs ON the EE thread once per guest
+// frame. Same declaration style as ps2_gif_arbiter.cpp's `extern int g438SlowArm(int)`.
+extern int g503EeSlowArm();
+extern void g503RegisterEeThread();
+// ⭐ G651 (ROADMAP P1 objective 2): the EE dispatch-family counting instrument, defined in
+// ps2_runtime_parts/runtime_init_and_signals.inc. Declared at GLOBAL scope, above the anonymous
+// namespace, so it binds to the external symbol (appendix-dc2-project.md §3's linkage trap).
+extern void g651DispatchReport(unsigned long long presents);
+extern uint64_t ps2EeWaitCpuNs();
+
+// G183: statistical PC-sampling profiler. G182 found EE is 90-99% on-CPU with 92-93% of
+// that time inside the single mgEndFrame call -- but mgEndFrame is translated GUEST code
+// (a deep inlined C++ call tree with no returns to instrument), so there are no free
+// per-region timers the way there are for runtime code. Instead, sample the LIVE
+// per-instruction ctx->pc (same technique F50.2's hang-watch used, and the same cross-
+// thread unsynchronised-scalar-read precedent as F50.2/F66/G151/G156) from a dedicated
+// host thread at high frequency WHILE mgEndFrame executes on the EE thread, and histogram
+// hot addresses. Symbolize offline against ref/functions + ref/index -- this profiler
+// only needs to name the addresses, not embed a symbolizer. Default-off (DC2_G183_PCSAMPLE=1),
+// zero cost when unset (thread never spawned).
+static std::atomic<bool> g_g183Sampling{false};
+static std::atomic<R5900Context *> g_g183Ctx{nullptr};
+static std::mutex g_g183HistMutex;
+static std::unordered_map<uint32_t, uint64_t> g_g183Hist;
+
+static void g183DumpAndReset(uint64_t total)
+{
+    std::vector<std::pair<uint32_t, uint64_t>> sorted;
+    {
+        std::lock_guard<std::mutex> lock(g_g183HistMutex);
+        sorted.assign(g_g183Hist.begin(), g_g183Hist.end());
+        g_g183Hist.clear();
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    std::fprintf(stderr, "[G183:pcsample] total=%llu distinctPc=%zu (top 20)\n",
+                 (unsigned long long)total, sorted.size());
+    for (size_t i = 0; i < sorted.size() && i < 20; ++i)
+    {
+        std::fprintf(stderr, "[G183:pcsample]   pc=0x%08x count=%llu (%.1f%%)\n",
+                     sorted[i].first, (unsigned long long)sorted[i].second,
+                     100.0 * (double)sorted[i].second / (double)std::max<uint64_t>(1, total));
+    }
+    // Full histogram, overwritten each flush (never appended) so it always reflects the
+    // most recent window -- consumed offline against ref/functions/ref/index.
+    if (FILE *f = std::fopen("captures/g183_pcsample.csv", "w"))
+    {
+        std::fprintf(f, "pc,count\n");
+        for (const auto &kv : sorted)
+            std::fprintf(f, "0x%08x,%llu\n", kv.first, (unsigned long long)kv.second);
+        std::fclose(f);
+    }
+}
+
+static void g183SamplerThreadMain()
+{
+    std::unordered_map<uint32_t, uint64_t> local;
+    uint64_t localCount = 0;
+    uint64_t windowTotal = 0;
+    auto lastFlush = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (g_g183Sampling.load(std::memory_order_relaxed))
+        {
+            R5900Context *ctx = g_g183Ctx.load(std::memory_order_relaxed);
+            if (ctx != nullptr)
+            {
+                ++local[ctx->pc];
+                ++localCount;
+            }
+        }
+        if (localCount >= 64)
+        {
+            std::lock_guard<std::mutex> lock(g_g183HistMutex);
+            for (auto &kv : local)
+                g_g183Hist[kv.first] += kv.second;
+            windowTotal += localCount;
+            local.clear();
+            localCount = 0;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (windowTotal > 0 &&
+            std::chrono::duration<double>(now - lastFlush).count() >= 5.0)
+        {
+            g183DumpAndReset(windowTotal);
+            windowTotal = 0;
+            lastFlush = now;
+        }
+    }
+}
+
+extern void (*g_g7_poll_live_pad_hook)();
+extern void (*g_g55_title_draw_probe_hook)(uint8_t *rdram);
+extern bool (*g_f66_drive_dungeon_pad_hook)(uint32_t);
+
+#if defined(PS2X_G654_DIAG)
+// G654 P16/P17: the exclusive, thread-keyed layer reporter, defined in the cold TU
+// ps2_g654_layerdiag.cpp. Declared HERE at global scope, above the anonymous namespace, or it would
+// bind to an internal-linkage entity and fail to link (the G568/G604 linkage lesson).
+void g654LayerReport(unsigned int n, unsigned int window);
+#endif
+
+// G704: `[G701:async]`'s reporter, defined in the GL backend TU. Declared HERE at global scope for
+// the same linkage reason as g654LayerReport above — and called from the `[G154:perf]` window in
+// dc2_game_override_parts/common_state.inc, which is the call site Rule 69 says must exist before
+// any G701 arm can be read. NOT behind PS2X_G654_DIAG: the promotion gate runs on the SHIP binary.
+void g701_backend_report();
+void g705_backend_report();
+
+// G704: cumulative G291/page-memo reporter from the GS rasterizer TU.  This must be reachable
+// from DC2_G291_STAT alone; otherwise the inline [G291:skip] stream makes a dead summary reporter
+// look healthy and the page-memo oracle cannot prove that any memo hit was verified.
+void g704_page_memo_report();
+
+// G141: perf ns accumulators, defined in ps2_gs_rasterizer.cpp / ps2_vu1.cpp (external linkage).
+extern std::atomic<uint64_t> g_g141GsRasterNs;
+extern std::atomic<uint64_t> g_g141Vu1RunNs;
+extern std::atomic<uint64_t> g_g146Vif1Ns;
+extern std::atomic<uint64_t> g_g146GifSubmitNs;
+extern std::atomic<uint64_t> g_g146GsImageNs;
+extern std::atomic<uint64_t> g_g146GsLocalNs;
+extern std::atomic<uint64_t> g_g146G144FlushMidNs;
+extern std::atomic<uint64_t> g_g146G144FlushUploadNs;
+extern std::atomic<uint64_t> g_g146G144FlushFrameNs;
+extern std::atomic<uint64_t> g_g146G144FlushMidCount;
+extern std::atomic<uint64_t> g_g146G144FlushUploadCount;
+extern std::atomic<uint64_t> g_g146G144FlushFrameCount;
+extern std::atomic<uint64_t> g_g147GsGifPacketNs;
+extern std::atomic<uint64_t> g_g147GsGifPacketCount;
+extern std::atomic<uint64_t> g_g147DrawPrimitiveNs;
+extern std::atomic<uint64_t> g_g147DrawPrimitiveCount;
+extern std::atomic<uint64_t> g_g434L2lEdges;
+extern std::atomic<uint64_t> g_g434Kicks;
+extern std::atomic<uint64_t> g_g434DrawKicks;
+extern std::atomic<uint64_t> g_g147GifTags;
+extern std::atomic<uint64_t> g_g147PackedRegs;
+extern std::atomic<uint64_t> g_g147ReglistRegs;
+extern std::atomic<uint64_t> g_g147ImageBytes;
+extern std::atomic<uint64_t> g_g171RegNs[16];
+extern std::atomic<uint64_t> g_g171RegCount[16];
+extern std::atomic<uint64_t> g_g171AdNs[256];
+extern std::atomic<uint64_t> g_g171AdCount[256];
+
+void g7_poll_live_pad();
+void g55_title_draw_probe(uint8_t *rdram);
+bool f66_drive_dungeon_pad(uint32_t);
+
+// G189 & G440 diagnostics, defined in ps2_gif_arbiter.cpp. Declared here at global scope
+// so nested templates and lambdas bind to external linkage symbols.
+void g189_set_closure_stage(int stage, uint32_t n);
+bool g440_latch_prof_on();
+void g440_note_flush_ns(uint64_t ns);
+
+// PHASE F25: forward-decl for delegation when path is not the empty-stem map pattern.
+// Defined in recomp/LoadFile2__FPcPvPii_0x149370.cpp.
+extern void LoadFile2__FPcPvPii_0x149370(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EditDraw__Fv_0x1ae3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EditLoop__Fv_0x1abcf0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern bool g_g186SpBalArmed; // ps2_runtime.cpp — G186 sp-balance logging armed while inside EditDraw
+extern void TitleLoop__Fv_0x29ffa0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void vblankHandler__Fi_0x299800(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void handler_endimage__Fi_0x2998e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void voBufIncCount__FP5VoBuf_0x299a40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void voBufDecCount__FP5VoBuf_0x299b90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void startDisplay__Fi_0x29b820(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void stepMain__Fv_0x299330(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void decBs0__FP8VideoDec_0x29b8a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void TitleModeInit__Fv_0x2a1020(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuInit__F13INIT_LOOP_ARG_0x191970(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuLoop__Fv_0x191c30(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuMainLoop__Fv_0x233fc0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void PauseLoop__Fv_0x309de0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TitleModeKey__Fv_0x2a1220(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TitleMCCheckKey__Fv_0x2a2ad0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Step__18CMemoryCardManagerFv_0x2f1fc0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuCheckPushButton__Fv_0x23e1b0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ConvertCheckPushButton__Fi_0x23e2e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuMainInit__FP13MENU_INIT_ARG_0x232df0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuMainKey__Fv_0x233ff0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuMainDraw__Fv_0x234290(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuCostumeDraw__Fv_0x2be040(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void FinishForMC__18CMemoryCardManagerFv_0x2f19a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void InitSaveData__Fv_0x1908a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoadFileMenu__FPcP1i_0x251100(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EnterIMGFile__17mgCTextureManagerFPUciP9mgCMemoryP15mgCEnterIMGInfo_0x12da90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ReloadTexture__17mgCTextureManagerFiP13sceVif1Packet_0x12e850(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetUserDataMan__Fv_0x196be0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetChrEquipDirect__16CUserDataManagerFii_0x19d560(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DebugGetItem__FP16CUserDataManageri_0x1a1b80(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetCharaDataPtr__16CUserDataManagerFi_0x19b490(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetItemFilePath__Fii_0x195d40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetMenuLoadItemNo__Fi_0x2afdb0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void UpDate__8CGamePadFv_0x14a930(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Update__11CPadControlFP8CGamePad_0x2ed550(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void sndStep__Ff_0x18d650(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void StepSnd__6CSceneFv_0x2a7940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TitleDraw__Fv_0x2a0ab0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetPoly__8CEditMapFiP6CCPolyR9mgVu0FBOXi_0x1b0780(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G625: monster script _ESM_CREATE (the projectile-effect spawn command).
+extern void ps2__ESM_CREATE__FP12RS_STACKDATAi_0x1e6620(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ps2__SET_DMG2__FP12RS_STACKDATAi_0x1e32f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ps2__SET_MOS__FP12RS_STACKDATAi_0x1e5f20(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateEffSpt__16CEffectScriptManFPcii_0x2e1260(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateEffSpt__16CEffectScriptManFiii_0x2e0d60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void BuildBase__16CEffectScriptManFiP1iP1iP9mgCMemoryi_0x2e0420(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ezTransToIOP2__FPvPvi_0x18b310(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G363: real SetCurrentDir body (wrapped by the DC2_G363_PATHTRACE probe).
+extern void SetCurrentDir__FPc_0x148760(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Step__14CCameraControlFi_0x2ec110(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetFollow__15mgCCameraFollowFfff_0x131990(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DngMainDraw__Fv_0x1cf090(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TitleModeDraw__Fv_0x2a1b60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TitleMapDraw__Fv_0x2a2280(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G57: scoped back-edge preemption suppression (defined in ps2_runtime.cpp). Held > 0
+// while the title-frame draw runs so the recompiled deferred-draw bodies, which the
+// title override invokes as direct C++ calls, run to completion instead of leaking a
+// mid-loop preemption resume PC (which left BeginDraw's mgr[4]/mgr[6] null ג†’ flush crash).
+extern std::atomic<int> g_dc2PreemptSuppressDepth;
+// G214: extern-visible host present-loop tick (defined in ps2_runtime.cpp) so the skin-matrix
+// collapse scanner can print the frame_NNNNNN.ppm number an event lands on.
+extern std::atomic<uint64_t> g_dc2PresentTick;
+// G598: the G138 packet-dump gate (defined in ps2_runtime.cpp). DC2_G138_GSDUMP_AT_TICK opens it on
+// a HOST tick, which names a different script position in every arm for exactly the reason the
+// tick-keyed frame dump did; DC2_G598_GS_AT_SF opens it on the SCRIPT clock instead. File scope,
+// not inside the anonymous namespace below.
+extern std::atomic<bool> g_dc2G138DumpGateOpen;
+// G599: the SCRIPT clock, published for cross-TU diagnostics (defined in ps2_memory.cpp's
+// memory_page_table_and_translate.inc). Only this TU can compute it, and the GS-side censuses need
+// it to window themselves on the defect's script moment. Same file-scope rule as the two above —
+// declaring it inside the anonymous namespace below would name a different, never-defined symbol.
+extern std::atomic<uint32_t> g_dc2ScriptFrame;
+// ⭐ G738 (ported from DC2-PS2RECOMP G721-G745): the RENDERED-frame clock, stored beside the script
+// clock in memory_page_table_and_translate.inc. Same file-scope rule as the two above.
+extern std::atomic<uint32_t> g_dc2RenderedFrame;
+// ⭐ G734/G735 (ported): the GS EXECUTOR thread's monotonic busy/idle totals and the generalised
+// per-thread CPU slot reader, for the acceptance board. Declared here at FILE scope on purpose —
+// the reporting site in frame_end_and_core_helpers.inc sits inside an anonymous namespace, so an
+// `extern` written there would declare an internal-linkage symbol and the link would fail with
+// LNK2001 on `` `anonymous namespace'::g713_exec_busy_ns ``. Defined in ps2_g713_pipeline.cpp.
+extern uint64_t g713_exec_busy_ns();
+extern uint64_t g713_exec_idle_ns();
+extern uint64_t g713_exec_cpu_ns();
+extern uint64_t g735ThreadCpuNs(int slot);
+// G56: main-title map geometry-submission chain (delegated by the G56 chain taps).
+extern void Draw__9CMapPartsFv_0x15e3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void PreDraw__9CMapPartsFv_0x166a00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Draw__9CMapPieceFv_0x166e40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void BeginDraw__14mgCDrawManagerFP9mgCMemoryPi_0x135230(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G57: DrawWater (last call in TitleMapDraw) ג€” wrapped by g57_drawwater_skip bisection tool.
+extern void DrawWater__4CMapFP9mgCCameraP10mgCTextureP10mgCTexture_0x15e800(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G194: town-scene effect-pass bisection targets (giant dark overlay tris sampling 0x28c0/T8).
+extern void DrawEffect__6CSceneFi_0x2c8820(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DepthOfField__FiPfP10mgCTexturef_0x17e320(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TexAnime__15mgCTextureAnimeFiP13sceVif1Packet_0x13bd90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgSetPkMoveImage__FP10mgCTexture9mgRect_i_P10mgCTextureiii_0x144560(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawEffect__8CEditMapFv_0x29c1c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawEffect__4CMapFv_0x15e3f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G129: SPI map-config WATER_VERTEX command handler ג€” creates a CWaterFrame (CreateWaterFrame@0x185D40)
+// and stores it into the global `cfgWater`. The title water arrays (CMap+0xcec/+0xcf0) are empty on
+// the runner; this probe tells whether the title map's config script dispatches WATER_VERTEX at all.
+extern void cfgWATER_VERTEX__FP9SPI_STACKi_0x1648f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G58: remaining links of the title geometry-queue chain (wrapped by the g58 $ra-canary).
+extern void Draw__4CMapFv_0x160b10(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawSub__8CEditMapFi_0x1b4130(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawSub__4CMapFi_0x15e250(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawSub__9CMapPartsFi_0x166a70(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Draw__12CObjectFrameFv_0x169fd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G58: title camera-follow accessors (the crash trace ends AddHeight x3 -> 0x9f84a0).
+extern void AddDistance__15mgCCameraFollowFf_0x131a20(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetDistance__15mgCCameraFollowFv_0x131a10(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void AddHeight__15mgCCameraFollowFf_0x131a50(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G58: title camera assignment (TitleInit calls this 2x to put the camera in scene slot 0/1).
+extern void AssignCamera__6CSceneFiP9mgCCameraPc_0x283740(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G58: GetCamera__6CScene ג€” wrapped to assign the title camera on demand (ordering fix).
+extern void GetCamera__6CSceneFi_0x2838c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G193: town/edit-map camera diagnosis (scene->Initialize ordering vs EditInit's AssignCamera).
+extern void Initialize__6CSceneFv_0x282ea0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EditInit__F13INIT_LOOP_ARG_0x1a9f40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void NextLoop__Fi13INIT_LOOP_ARG_0x190900(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G59: title MDS texture-block return probe.
+extern void GetTextureBlockNo__11CMdsListSetFiPii_0x168fd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgDraw__FP8mgCFrame_0x142f90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuItemCharaDataLoad__FP9mgCMemoryiPP17MENU_BGREAD_INFO2i_0x2b90d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ReadBGSync__Fv_0x148e70(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ReadMainCharaBG__Fv_0x2bbc80(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void KeyMainCharaBG__Fv_0x2bc150(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MenuCostumeKey__Fv_0x2be030(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G358: Sindain inventory circular viewport (type-0x0d form-piece live-vs-cached diagnosis).
+extern void MenuInternSelectDraw__Fv_0x236850(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void InitDungeonMain__F13INIT_LOOP_ARG_0x1cc040(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoopDungeonMain__Fv_0x1cea00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Step__12CMenuTreeMapFv_0x1eff40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TitleExit__Fv_0x29ff30(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CaptureEnd__8CGamePadFv_0x14b600(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void PrimQuad__FP11mgCDrawPrimff9mgRect_i__0x21fe60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void PrimQuad__FP10mgCTextureff9mgRect_i_iiii_0x21ff30(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateMap__4CMapFP11CMdsListSetP9mgCMemory_0x1600d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoadMapFile__4CMapFPciP9mgCMemoryi_0x164480(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoadMapFromMemory__6CSceneFiP17SCN_LOADMAP_INFO2_0x285670(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoadMapFromMemory__6CSceneFiiP17SCN_LOADMAP_INFO2_0x2856f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoadMap__6CSceneFiP17SCN_LOADMAP_INFO2i_0x285ce0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetScale__10CFuncPointFPf_0x1643a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetRotation__10CFuncPointFPf_0x1643c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetPosition__10CFuncPointFPf_0x1643e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetScale__9mgCObjectFPf_0x136340(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetRotation__9mgCObjectFPf_0x136270(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetPosition__9mgCObjectFPf_0x136190(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ActiveLighting__13mgRENDER_INFOFii_0x139120(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Begin__11mgCDrawPrimFi_0x1344a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void End__11mgCDrawPrimFv_0x134690(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Color__11mgCDrawPrimFiiii_0x134c80(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Texture__11mgCDrawPrimFP10mgCTexture_0x134da0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DirectData__11mgCDrawPrimFi_0x134b00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EndPrim2__11mgCDrawPrimFv_0x134940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgEndFrame__FP14mgCDrawManager_0x1425b0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE G15: costume/character deform-mesh build path (split VU1-dormant vs packet-not-built).
+extern void mgDrawDirect__FP8mgCFrame_0x142fd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawDirect__12CActionCharaFv_0x16b940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE G205: field-character (non-"Direct") draw entry, town Max candidate.
+extern void Draw__12CActionCharaFv_0x16b850(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawDirect__11CCharacter2Fv_0x1731f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Draw__8mgCFrameFPUi_0x137e10(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetDeformMesh__11CCharacter2Fv_0x1730b0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE G209: per-frame world (skin) matrix builder, test of G207/G208's skin-matrix hypothesis.
+extern void GetLWMatrix__8mgCFrameFPA4_f_0x137030(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE G34: costume model RTT->display composite (the outline/preview pass).
+extern void Draw__12COutLineDrawFff_0x17c2d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CheckHit__10CDAColPipeFPf_0x17c090(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawDivSprite4__FP11mgCDrawPrim9mgRect_i_P10mgCTexturePiii_0x17cb20(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgClipBoxW__FPfPfPfPf_0x12f2e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgClipInBoxW__FPfPfPfPf_0x12f380(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void test1__FPA4_fPA4_fPA4_fPfPf_0x135c70(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgSendVuProg__FPUii_0x145e80(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void AddPacket__14mgCDrawManagerFiP1P1i_0x1359d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateFacePacket__12mgCVisualMDTFPUiP7mgCFace_0x13ff60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreatePacket__12mgCVisualMDTFP14mgCDrawManager_0x13f6a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreatePacket__15mgCVisualFixMDTFP14mgCDrawManager_0x13f920(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateRenderInfoPacket__12mgCVisualMDTFPUiPA4_fP13mgRENDER_INFO_0x1404d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateRenderInfoPacket__18mgCVisualMotionMDTFPUiPA4_fP13mgRENDER_INFO_0x28a660(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CalcGlidPutPos__11CDngFreeMapFP9GLID_INFORfRfi_0x1ea890(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void InitEnd__12CMenuTreeMapFv_0x1ef9f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetTextureInfo__11CDngFreeMapFv_0x1eabe0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetPackFile__FPUiPcPi_0x149cd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetReadBGFile__Fi_0x148c70(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void LoadFileBG__FPcP1Pi_0x148930(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void InitReadBG__Fv_0x1488d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void StartReadBG__Fv_0x148cc0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MapJump__FP6CSceneP17SCN_LOADMAP_INFO2i_0x2ded50(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G361 spawn probe
+extern void WaitVSync__Fii_0x1412a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void VSyncCallBack__Fi_0x141200(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void sceGsSyncVCallback_0x1041e8(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void sceGsSyncV_0x103300(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgEndDrawReloadTexture__FiP14mgCDrawManager_0x142560(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgEndDraw__FiP14mgCDrawManager_0x142580(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Draw__14mgCDrawManagerFiP13sceVif1Packet_0x135720(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE F50.9: dungeon CLUT/texture upload probe. mgLoadImage builds the VIF1
+// BITBLTBUF+IMAGE packet for both texture pixels and (via ReloadCLUT) the palette.
+extern void mgLoadImage__FPUiiiiP1iiiii_0x12e600(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ReloadTexture__17mgCTextureManagerFiP13sceVif1Packet_0x12e850(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE F50.10: dungeon texture-manager reload. ReloadTexture rewrites each texture's
+// sceGsTex0 (struct+0x38) TBP0/CBP to the current VRAM allocation, but only uploads
+// pixels when the mip-0 data ptr (+0x50) is non-zero and the CLUT when (+0x60) is
+// non-zero. We log the post-reload TEX0 vs the data/CLUT pointers to see whether the
+// dungeon's sampled texture (tbp=0x2580/cbp=0x2980) has a null data/CLUT source.
+extern void ReloadTexture__17mgCTextureManagerFiPUi_0x12e970(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE F50.11: mgCDrawPrim::Texture(drawprim, texEnv) copies the texEnv's sceGsTex0
+// (texEnv+0) into the draw packet. This is where the dungeon geometry's TEX0 (tbp=0x2580
+// cbp=0x2980 PSMCT16) is bound. We capture the source texEnv pointer + its TEX0 so we can
+// identify which texture/manager owns the empty 0x2580 page.
+extern void Texture__11mgCDrawPrimFP10mgCTexture_0x134da0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE F50.11: GetTexture(mgr, name, idx) returns an mgCTexture (sceGsTex0 at +0x38).
+// Identifies which manager + texture name owns the empty 0x2580 page.
+extern void GetTexture__17mgCTextureManagerFPci_0x12d050(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+
+namespace ps2_stubs
+{
+    void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+    void clearPadOverrideState();
+    void sceDevctl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // Kernel/Stubs/FileIO.cpp: no-HDD fail (-11)
+}
+
+// PHASE G34: set while inside DrawDivSprite4 (the model RTT->display composite) so the GS
+// rasterizer can tag which 0x2720-sampling draws are the composite vs the brick background.
+extern std::atomic<int> g_g34_in_divsprite;
+
+// PHASE G37: set while inside Draw__12COutLineDraw (the costume preview outline+composite
+// path) so the mgGetDrawRect wrapper only repairs the model bounding box for THIS draw,
+// not for any other COutLineDraw user.
+static std::atomic<int> g_g37_in_outline{0};
+
+// G215: expose the COutLineDraw character-draw window to the VU1 interpreter so its
+// per-model-batch cull discriminator (DC2_G215_BATCH) can scope model executes to the
+// character pass. Only meaningful when the outline wrapper is registered (DC2_G205_FVAR13_TRACE
+// or DC2_G9_COSTUME); otherwise g_g37_in_outline stays 0 and the probe emits nothing.
+bool dc2_g215_in_char_outline() { return g_g37_in_outline.load(std::memory_order_relaxed) > 0; }
+
+// G89: defined in ps2_gs_rasterizer.cpp; set by g67_title_scope each frame so the rasterizer's
+// title-rock guard-band cull only fires in the title-map scene. Declared at global scope (external
+// linkage) -- declaring it inside the anonymous namespace below would give it internal linkage.
+extern std::atomic<bool> g_dc2TitleRockScope;
+extern std::atomic<bool> g_dc2TownDepthScope;
+// G90: current logical title block flushing through mgEndDraw (rasterizer-side, [G88:geo] tag).
+extern std::atomic<int> g_dc2TitleCurBlock;
+// G144: defined in ps2_gs_rasterizer.cpp; drains trailing deferred tile-binning triangles at frame
+// end. Declared at global scope (external linkage) — a local extern inside the anon namespace below
+// would bind to an anon-namespace symbol (internal linkage) and fail to link.
+extern void g144FlushPending();
+// G150 MTGS (multi-threaded GS): defined in ps2_gif_arbiter.cpp. When DC2_G150_MTGS=1 the GS drain
+// runs on a dedicated worker thread. g150_frame_barrier runs this closure (G144 flush + present
+// latch) correctly either way: with DC2_G157_PIPELINE=1 it hands the closure to the worker as a
+// frame-boundary marker and the EE returns immediately (bounded ≤1-frame pipeline overlap,
+// register-write races against the worker's deferred latch closed by ps2_memory.cpp's
+// g150_pipeline_wait_register_slot() gate); otherwise it blocks the EE until the worker has
+// finished this frame's draws and then runs the closure here, on the EE thread (G150-v2). When
+// MTGS is off, g150_frame_barrier runs the closure inline (byte-identical to the pre-G150 path).
+extern bool g150_mtgs_enabled();
+extern void g150_frame_barrier(std::function<void()> latch);
+extern void g150_wait_idle();
+// G412: depth-two frame pipeline and immutable worker-side presentation latch.
+extern bool g412_cross_frame_enabled();
+extern uint64_t g412_capture_vsync_tick();
+extern void g412_latch_host_presentation_snapshot(GS *gs,
+                                                  uint64_t pmode,
+                                                  uint64_t smode2,
+                                                  uint64_t dispfb1,
+                                                  uint64_t display1,
+                                                  uint64_t dispfb2,
+                                                  uint64_t display2,
+                                                  uint64_t bgcolor,
+                                                  uint64_t vsyncTick);
+extern void g677_latch_logical_host_presentation_frame(GS *gs);
+extern void g677_latch_logical_host_presentation_snapshot(GS *gs,
+                                                          uint64_t pmode,
+                                                          uint64_t smode2,
+                                                          uint64_t dispfb1,
+                                                          uint64_t display1,
+                                                          uint64_t dispfb2,
+                                                          uint64_t display2,
+                                                          uint64_t bgcolor,
+                                                          uint64_t vsyncTick);
+
+// G303: VU1-worker (MTVU) busy-time attribution — snapshotted per perf window in the G146 block
+// to place the VU1 worker on the same footing as GSimage/EE for pole attribution.
+extern uint64_t g297WorkerBusyNs();
+extern uint64_t g297WorkerKicksRun();
+extern uint64_t g297GsCollectStallNs();
+extern uint64_t g297GsCollectStalls();
+// G344: TOTAL time in collectWindowPackets (all windows). merge OVERHEAD = total - stall,
+// distinguishing removable per-window handoff cost from VU1-catch-up idle (the stall).
+extern uint64_t g297GsCollectTotalNs();
+extern uint64_t g297GsCollectCalls();
+extern uint64_t g303_gs_worker_busy_ns();
+extern uint64_t g332_gs_worker_total_ns();
+extern void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
+
+// G217: one-shot exact head-object packet correlation consumed by ps2_memory.cpp.
+std::atomic<uint32_t> g_dc2G217HeadDmaPacket{0u};
+std::atomic<uint32_t> g_dc2G217HeadDmaSelf{0u};
+std::atomic<uint32_t> g_dc2G217HeadDmaKind{0u};
+std::atomic<uint32_t> g_dc2G217DirectPackets[128]{};
+std::atomic<uint32_t> g_dc2G217DirectPacketWrite{0u};
+
+// G361: force-recompile marker — dungeon_init.inc gained the mwInit/__sinit boot
+// repair ([G361:sinit]) and then the per-entry ctor-table walk + bisect levers
+// ([G361:ctor], DC2_G361_SINIT_FIRST/LAST/SKIP/TRACE); MSBuild does not reliably
+// rebuild this TU on .inc-only edits (G359 stale-link trap), so this comment must
+// change with it. Now also carries [G361:pos] / [G361:mapjump] (DC2_G361_POS=1)
+// and the default exclusion of __sinit_mainloop.cpp (DC2_G361_SINIT_ALL=1 re-includes).
+// G382: force-recompile marker for the default-off MapJump init-footprint hash census
+// (DC2_G382_INIT_HASH / DC2_G382_INIT_FINE), used to identify index-5 state that
+// survives InitSaveData; also corrects G361 position tracing to walk MainScene slots.
+// G382 closure: index 5 remains excluded; SINIT_ALL is diagnostic, not promotion.
+// G376: F21 seed's mode-0 FMV-skip arm retired (DC2_G376_SEED_FMV_SKIP=1 restores).
+// G375b: also carries fmv_ipu.inc (real DIntr/EIntr for the movie DMA path +
+// DC2_G375_MOVIE_TRACE census probes,
+// kill switch DC2_G375_NO_INTR=1) — bump this marker on every .inc-only edit.
+// G381: carries g381_dead_stub_repairs.inc (non-throwing handlers for the 36 `!! DEAD`
+// TODO_NAMED stub addresses; kill switch DC2_G381_NO_DEAD_STUBS=1, trace DC2_G381_TRACE=1, selftest DC2_G381_SELFTEST=1).
+// G385: carries Sony HD/BD SFX + SQ BGM playback and focused RPC/DMA/MSIN/voice-open tracing
+// (kill DC2_G385_NO_GAME_AUDIO=1, trace DC2_G385_AUDIO_TRACE=1).
+// G391: carries the bank-SFX voice mixer (HD ADSR, VAG loop points, pan, SPU2
+// reverb) and the fixed BGM bus gain. Kill switches: DC2_G391_LEGACY_SFX_PATH=1,
+// DC2_G391_NO_ADSR=1, DC2_G391_NO_REVERB=1, DC2_G391_LEGACY_BGM_NORM=1.
+// G392: `F9 00` is the SE volume and `F9 01` the SE pan (they were swapped since
+// G385); BGM now shares the G391 mixer bus so it takes the reverb send, and the
+// reverb itself is the documented SPU preset network.
+// Kill: DC2_G392_LEGACY_SE_MIX=1, DC2_G392_NO_BGM_BUS=1.
+// G677 revision 3: forced-debug MenuLoop hands logical-VRAM authority to the next existing
+// mgEndFrame boundary; no duplicate boundary, no stale native-FBO alternation
+// (DC2_G677_NO_DEBUG_FRAME_BOUNDARY=1).
+void dc2G385PlaySfx(PS2AudioBackend *audioBackend, uint32_t soundSlot,
+                    uint8_t program, uint8_t key, uint8_t velocity,
+                    uint8_t channelVolume, uint8_t voiceId, uint8_t channelPan);
+void dc2G385StopSfx(uint32_t soundSlot, uint8_t key, uint8_t voiceId);
+int dc2G391SelfTest();
+void dc2G385SetSfxParam(uint32_t soundSlot, uint8_t key, uint8_t voiceId,
+                        uint8_t subtype, uint32_t value);
+extern void StreamOpenFast__6CSoundFiPc_0x18aef0(
+    uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+// G450: BGM start/stop edge attribution (DC2_G450_BGM_TRACE=1). Wrappers chain
+// straight into these bodies, so registering them changes no behaviour.
+extern void PlayBGM__6CSceneFiif_0x2a6110(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void StopBGM__6CSceneFi_0x2a6280(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void StopEnvBGM__6CSceneFv_0x2a67c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void PlayEnvBGM__6CSceneFif_0x2a6690(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSeStop__FUiii_0x18e830(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSqPlay__Fiii_0x18f660(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSqStop__Fii_0x18f6c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSePlayV__FUiiii_0x18e080(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void PlayEnvBgm__6CSceneFv_0x2a6840(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void SearchSndDataID__6CSceneFi_0x2a6c30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+namespace
+{
+#include "dc2_game_override_parts/common_state.inc"
+// G619: must follow common_state.inc (it uses dc2_env_flag_enabled) and precede every probe file
+// that reads one of the cached flags. See the file header for why `getenv` was 20.7% of the EE
+// thread on `dungeon1`.
+#include "dc2_game_override_parts/g619_env_flag_cache.inc"
+#include "dc2_game_override_parts/texture_probes.inc"
+#include "dc2_game_override_parts/title_camera_and_map.inc"
+#include "dc2_game_override_parts/frontend_loops.inc"
+#include "dc2_game_override_parts/title_map_pipeline.inc"
+#include "dc2_game_override_parts/frontend_costume_camera.inc"
+#include "dc2_game_override_parts/dungeon_init.inc"
+
+// F56: classify the in-dungeon state each frame. DngStatus selects the
+// LoopDungeonMain branch: 0=3D world (DngMainDraw@0x1CF090), 1/4=menu
+// (MenuMainDraw), 2=event, 3=event-edit, 5=exit. DngTreeMode is the
+// floor-select treemap sub-state (0=display map, 1=transition/confirm).
+// Addresses resolved from assembly:
+//   DngStatus  : lui at,0x1ea; lw s1,-0x920(at)        -> 0x01E9F6E0 (word)
+//   DngTreeMode: lh a0,-0x70fc(gp) (DngTreeMapDraw)     -> gp-0x70fc = 0x003773F4 (half)
+// Quiet unless DC2_TRACE_F56. Bounded: logs on state change + every 60th
+// frame, capped, so the floor-select->3D transition is visible compactly.
+// G409: restore Dungeon 6's missing "s19" world-origin latch before town exit
+// event 100; rollback DC2_G409_LEGACY_DUNGEON_MAP_LATCH, trace DC2_TRACE_G409.
+#include "dc2_game_override_parts/dungeon_runtime.inc"
+
+#include "dc2_game_override_parts/title_draw_runtime.inc"
+// G625: monster projectile / damage-path probes (default off). Must precede
+// frame_end_and_core_helpers.inc, whose per-frame [G625:hp] line reads g625_active_colprims().
+#include "dc2_game_override_parts/g625_monster_ai_probes.inc"
+// G412 force-recompile marker: frame_end captures immutable PCRTC state for depth-two MTGS.
+#include "dc2_game_override_parts/frame_end_and_core_helpers.inc"
+#include "dc2_game_override_parts/g363_spheda_probes.inc"
+// G390: MODMSIN key-on with velocity 0 is a key-off (DC2_G390_LEGACY_SFX=1).
+#include "dc2_game_override_parts/object_init_and_pad.inc"
+
+#include "dc2_game_override_parts/live_input_and_stubs.inc"
+
+namespace
+{
+#include "dc2_game_override_parts/coop_controller.inc"
+}
+
+// Pad accessor for the Lua mod API: g_pad_live_* live in the anonymous
+// namespaces above (common_state.inc), so another TU can only read them here.
+void dc2GetLivePad(uint16_t *mask, uint8_t *lx, uint8_t *ly,
+                   uint8_t *rx, uint8_t *ry, bool *connected)
+{
+    if (mask) *mask = g_pad_live_mask;
+    if (lx) *lx = g_pad_live_lx;
+    if (ly) *ly = g_pad_live_ly;
+    if (rx) *rx = g_pad_live_rx;
+    if (ry) *ry = g_pad_live_ry;
+    if (connected) *connected = g_pad_live_connected;
+}
+
+// PHASE9: DC2 — Register the Phase 9.3 stub override.
+// The actual ELF filename on disc is SCUS_972.13 (not dc2.elf).
+PS2_REGISTER_GAME_OVERRIDE(
+    "DC2 Phase 9.3 stub address bindings",
+    "SCUS_972.13",
+    0u,
+    0u,
+    applyDC2Phase9Stubs)
+
+// PHASE F9: DC2 — Register ezMidi audio-compat override.
+PS2_REGISTER_GAME_OVERRIDE(
+    "Dark Cloud 2 ezMidi compat",
+    "SCUS_972.13",
+    0u,
+    0u,
+    applyDC2EzMidiCompat)
+
+// COOP: DC2 — Register 2-Player Co-Op override.
+PS2_REGISTER_GAME_OVERRIDE(
+    "Dark Cloud 2 2-Player Co-Op",
+    "SCUS_972.13",
+    0u,
+    0u,
+    applyDC2CoopOverrides)

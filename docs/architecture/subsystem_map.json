@@ -1,0 +1,92 @@
+{
+  "subsystem_id": "dc2_recomp_platform",
+  "scope": "Modded Subsystem / Static Recompilation Platform",
+  "primary_source_files": [
+    "ps2xRuntime/src/lib/game_overrides.cpp",
+    "ps2xRuntime/src/dc2_game_override.cpp",
+    "ps2xRuntime/src/dc2_game_override_parts/frame_end_and_core_helpers.inc",
+    "ps2xRuntime/src/dc2_game_override_parts/coop_controller.inc",
+    "ps2xRuntime/src/dc2_coop_v5_net.cpp",
+    "ps2xRuntime/src/dc2_authority_input_scheduler.h",
+    "ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp",
+    "ps2xRuntime/src/lib/ps2_runtime.cpp",
+    "ps2xRuntime/src/lib/ps2_g713_pipeline.cpp",
+    "ps2xRuntime/src/lib/ps2_g713_pipeline_api.inc",
+    "ps2xRuntime/src/lib/ps2_gif_arbiter.cpp",
+    "ps2xRuntime/src/lib/ps2_runtime_parts/runtime_mtvu_and_env.inc",
+    "ps2xRuntime/src/lib/ps2_memory_parts/memory_page_table_and_translate.inc"
+  ],
+  "build": {
+    "script": "build_runner.bat",
+    "target": "ps2EntryRunner",
+    "toolchain": "VS2019 BuildTools clang-cl 12.0.0 + Ninja",
+    "artifact": "build64/ps2xRuntime/ps2EntryRunner.exe",
+    "build_dir": "build64"
+  },
+  "hook_targets": [
+    {
+      "target_function": "registerFunction(address, func)",
+      "target_file": "ps2xRuntime/include/ps2_runtime.h",
+      "injection_type": "Guest-address function replacement",
+      "side_effects": "Replaces a recompiled guest function with a host C++ implementation. Used by 323 address-based binds across the .inc parts."
+    },
+    {
+      "target_function": "bindAddressHandler(address, name)",
+      "target_file": "ps2xRuntime/src/lib/game_overrides.cpp",
+      "injection_type": "Named stub bind",
+      "side_effects": "Fails silently if the name is absent from PS2_STUB_LIST/PS2_SYSCALL_LIST; the 126 unresolved startup entries are exactly these SDK/debug names, not gameplay overrides."
+    },
+    {
+      "target_function": "PS2_REGISTER_GAME_OVERRIDE(name, elf, entry, crc32, fn)",
+      "target_file": "ps2xRuntime/include/game_overrides.h",
+      "injection_type": "Descriptor registration (static AutoRegister)",
+      "side_effects": "Filters by guest ELF name/entry/CRC32; requires /WHOLEARCHIVE on the ps2_runtime static lib, which the build applies."
+    },
+    {
+      "target_function": "g_dc2ScriptFrame",
+      "target_file": "ps2xRuntime/src/lib/ps2_memory_parts/memory_page_table_and_translate.inc",
+      "injection_type": "Cross-TU script clock (G599)",
+      "side_effects": "Written once per guest frame in f29_mgendframe_probe; read by GS-side censuses for windowing. Was never written before the 2026-09-25 merge."
+    },
+    {
+      "target_function": "g735CaptureThreadHandle(slot)",
+      "target_file": "ps2xRuntime/src/lib/ps2_g713_pipeline.cpp",
+      "injection_type": "Per-thread CPU capture at thread entry (G735, ported from Red-tv141/DC2-PS2RECOMP)",
+      "side_effects": "DuplicateHandle(GetCurrentThread) into a 3-slot table (0=G713 exec, 1=VU1/MTVU worker, 2=GS parse worker). Called once from each worker entry; read-only for diagnostics; ~2 reads/second from the EE frame boundary."
+    },
+    {
+      "target_function": "g713_exec_busy_ns / g713_exec_idle_ns / g713_exec_cpu_ns",
+      "target_file": "ps2xRuntime/src/lib/ps2_g713_pipeline.cpp",
+      "injection_type": "Monotonic executor busy/idle/CPU totals (G734/G735)",
+      "side_effects": "Busy/idle accumulators are gated on DC2_G182_EE_STAT (the board flag), so shipping runs pay one predicted branch per drain cycle and no clock reads. CPU column comes from GetThreadTimes on the duplicated exec-thread handle; 0 means no column."
+    }
+  ],
+  "state_dependencies": {
+    "reads": [
+      "guest EE RDRAM",
+      "DAC.csv symbol map (Name,Start,End,Size)",
+      "SCUS_972.13 ELF (name/entry/CRC32 for descriptor match)",
+      "ISO image via synthetic sector mount (DC2_ISO_PATH)"
+    ],
+    "writes": [
+      "host m_functionTable (guest address -> host function)",
+      "co-op snapshot / input-frame buffers",
+      "logs/latest.log (flush-on-exit; console is authoritative mid-run)"
+    ]
+  },
+  "invariants": [
+    "Override descriptors match on SCUS_972.13 + entry + CRC32; a mismatched ELF silently yields 0 applied overrides.",
+    "registerFunction never validates the address against the recompiled function table.",
+    "G599: g_dc2ScriptFrame.store() must run unconditionally once per guest frame in f29_mgendframe_probe or all script-clock-keyed probes miswindow.",
+    "G738: every per-window column must be PRIMED from the first non-zero read of its cumulative counter, not from zero; worker threads start lazily and an unprimed delta charges the thread's whole accumulated time to one window.",
+    "Diagnostic-only: the ported G734/G735/G738/G742 blocks must never be on a behaviour path. All accumulation is gated on DC2_G182_EE_STAT; with the flag unset the added cost is one predicted branch per drain cycle.",
+    "Still deferred from the Red-tv141 G721-G745 set: G739 (needs its G646-table ballast/oracle counters), G745 (needs the G726 kick spin, which this lineage does not have), and the G736/G737 route/GL censuses. Do not port them piecemeal."
+  ],
+  "related_subsystems": [
+    "coop_networking",
+    "gs_rasterizer",
+    "vu1_execution_stack",
+    "spu2_audio",
+    "dc2_mod_framework"
+  ]
+}
