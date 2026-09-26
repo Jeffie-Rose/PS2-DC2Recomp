@@ -1,0 +1,55 @@
+# Build outputs
+/bin/
+/intermediate/
+.vs/
+out
+.vscode
+build
+build64/
+logs/
+captures/
+*.ilk
+*.exp
+*.tlog
+*.ipch
+*.obj
+
+# .NET (dc2_Launcher)
+dc2_Launcher/**/bin/
+dc2_Launcher/**/obj/
+
+# Retail game data: never commit (copyright + size).
+# The launcher and scripts expect you to supply your own ISO / extracted DATA folder.
+SCUS_972.13
+*.iso
+DATA/
+
+# User state
+mc0/
+mc1/
+coop_saves/
+Saves/
+Config/launcher_settings.json
+Config/controller.json
+Config/extraction_state.json
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Distribution packages
+dist/
+
+# Android / IDE
+android/app/.cxx/
+android/local.properties
+android/.gradle/
+.idea/
+
+# NOTE: the recompiled game sources under ps2xRuntime/src/runner/ (and the
+# ps2_recompiled_functions.* tables) ARE tracked in this repository. They were
+# generated from SCUS_972.13 with ps2xRecomp (see config_dc2_final.toml) and are
+# what makes this a clone-and-build project.
+
+# Release packages
+release/
